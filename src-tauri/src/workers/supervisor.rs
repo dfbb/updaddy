@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::core::Ecosystem;
+use crate::core::{OperationBatch, TaskStatus};
 use crate::persistence::Database;
 
 use super::messages::WorkerCommand;
@@ -52,6 +53,7 @@ pub struct WorkerSupervisor {
     senders: HashMap<Ecosystem, mpsc::Sender<Envelope>>,
     cancellations: Arc<Mutex<HashMap<Uuid, CancellationToken>>>,
     handles: Mutex<Vec<JoinHandle<()>>>,
+    database: Option<Arc<Database>>,
 }
 
 impl WorkerSupervisor {
@@ -69,9 +71,19 @@ impl WorkerSupervisor {
             let sink = context.event_sink.clone();
             let database = context.database.clone();
             let active = cancellations.clone();
+            let lock = Arc::new(ResourceLock::new(resource_lock_key(ecosystem)));
             let handle = thread::spawn(move || {
                 let runtime = Builder::new_current_thread().enable_all().build();
-                let Ok(runtime) = runtime else { return };
+                let Ok(runtime) = runtime else {
+                    sink(WorkerEvent::WorkerState {
+                        ecosystem,
+                        sequence: 1,
+                        state: "failed".into(),
+                        emitted_at: chrono::Utc::now().timestamp(),
+                    });
+                    return;
+                };
+                let mut sequence = 0;
                 while let Ok(envelope) = rx.recv() {
                     if envelope.command.ecosystem().is_none() {
                         break;
@@ -83,22 +95,65 @@ impl WorkerSupervisor {
                         sink(WorkerEvent::TaskProgress {
                             task_id: id,
                             ecosystem,
+                            sequence: {
+                                sequence += 1;
+                                sequence
+                            },
                             status: crate::core::TaskStatus::Cancelled,
+                            completed: 1,
+                            total: 1,
+                            message: None,
                             error: None,
                             emitted_at: chrono::Utc::now().timestamp(),
                         });
                         active.lock().unwrap().remove(&id);
                         continue;
                     }
-                    runtime.block_on(run_command(
-                        ecosystem,
-                        id,
-                        command,
-                        adapter.clone(),
-                        cancel,
-                        sink.clone(),
-                        database.clone(),
-                    ));
+                    let _guard = lock.acquire();
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        runtime.block_on(run_command(
+                            ecosystem,
+                            id,
+                            command,
+                            adapter.clone(),
+                            cancel,
+                            sink.clone(),
+                            database.clone(),
+                            &mut sequence,
+                        ))
+                    }));
+                    if result.is_err() {
+                        if let Some(database) = &database {
+                            let _ = database.update_task(
+                                id,
+                                TaskStatus::Failed,
+                                Some(crate::core::TaskErrorKind::Unknown),
+                            );
+                        }
+                        sink(WorkerEvent::TaskProgress {
+                            task_id: id,
+                            ecosystem,
+                            sequence: {
+                                sequence += 1;
+                                sequence
+                            },
+                            status: TaskStatus::Failed,
+                            completed: 1,
+                            total: 1,
+                            message: Some("worker panicked".into()),
+                            error: Some(crate::core::TaskErrorKind::Unknown),
+                            emitted_at: chrono::Utc::now().timestamp(),
+                        });
+                        sink(WorkerEvent::WorkerState {
+                            ecosystem,
+                            sequence: {
+                                sequence += 1;
+                                sequence
+                            },
+                            state: "idle".into(),
+                            emitted_at: chrono::Utc::now().timestamp(),
+                        });
+                    }
                     active.lock().unwrap().remove(&id);
                 }
             });
@@ -109,6 +164,7 @@ impl WorkerSupervisor {
             senders,
             cancellations,
             handles: Mutex::new(handles),
+            database: context.database,
         }
     }
 
@@ -129,21 +185,40 @@ impl WorkerSupervisor {
             .ok_or(SupervisorError::Unavailable(Ecosystem::Homebrew))?;
         let id = command.task_id().unwrap_or_else(Uuid::new_v4);
         let cancel = CancellationToken::new();
-        self.cancellations
-            .lock()
-            .unwrap()
-            .insert(id, cancel.clone());
         let sender = self
             .senders
             .get(&ecosystem)
             .ok_or(SupervisorError::Unavailable(ecosystem))?;
+        // Persist the pending task before making it cancellable/visible to workers.
+        if let Some(database) = &self.database {
+            let task = super::worker::command_task(id, ecosystem, &command);
+            let batch = OperationBatch {
+                batch_id: Uuid::new_v4(),
+                ecosystem,
+                tasks: vec![task],
+                created_at: chrono::Utc::now().timestamp(),
+            };
+            database
+                .create_batch(&batch)
+                .map_err(|_| SupervisorError::Unavailable(ecosystem))?;
+        }
         sender
             .send(Envelope {
                 id,
                 command,
                 cancel,
             })
-            .map_err(|_| SupervisorError::Unavailable(ecosystem))?;
+            .map_err(|_| {
+                if let Some(database) = &self.database {
+                    let _ = database.update_task(
+                        id,
+                        TaskStatus::Failed,
+                        Some(crate::core::TaskErrorKind::Unknown),
+                    );
+                }
+                SupervisorError::Unavailable(ecosystem)
+            })?;
+        self.cancellations.lock().unwrap().insert(id, cancel);
         Ok(id)
     }
 
@@ -156,6 +231,9 @@ impl WorkerSupervisor {
             .cloned()
             .ok_or(SupervisorError::UnknownTask(task_id))?;
         token.cancel();
+        if let Some(database) = &self.database {
+            let _ = database.update_task(task_id, TaskStatus::Cancelled, None);
+        }
         Ok(())
     }
 }
@@ -172,9 +250,9 @@ impl Drop for WorkerSupervisor {
                 cancel: CancellationToken::new(),
             });
         }
-        for handle in self.handles.lock().unwrap().drain(..) {
-            let _ = handle.join();
-        }
+        // JoinHandle is intentionally dropped after cancellation. Dropping detaches
+        // a misbehaving adapter instead of blocking application shutdown forever.
+        self.handles.lock().unwrap().clear();
     }
 }
 
@@ -185,6 +263,29 @@ pub fn resource_lock_key(ecosystem: Ecosystem) -> &'static str {
         Ecosystem::Pip => "python-global",
         Ecosystem::Gem => "ruby-global",
         Ecosystem::Rustup => "rustup",
+    }
+}
+
+/// A named process-wide resource lock. Workers currently own one lock each;
+/// the named type keeps serialization explicit for adapters that share a scope.
+pub struct ResourceLock {
+    key: &'static str,
+    gate: Mutex<()>,
+}
+
+impl ResourceLock {
+    pub fn new(key: &'static str) -> Self {
+        Self {
+            key,
+            gate: Mutex::new(()),
+        }
+    }
+
+    pub fn key(&self) -> &'static str {
+        self.key
+    }
+    pub fn acquire(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.gate.lock().unwrap()
     }
 }
 

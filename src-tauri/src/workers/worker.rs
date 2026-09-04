@@ -5,7 +5,7 @@ use chrono::Utc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::core::{Ecosystem, Operation, OperationBatch, PackageTask, TaskErrorKind, TaskStatus};
+use crate::core::{Ecosystem, Operation, PackageTask, TaskErrorKind, TaskStatus};
 use crate::persistence::Database;
 
 use super::messages::WorkerCommand;
@@ -47,19 +47,18 @@ pub(crate) async fn run_command(
     cancel: CancellationToken,
     sink: WorkerEventSink,
     database: Option<Arc<Database>>,
+    sequence: &mut u64,
 ) {
-    if let Some(database) = &database {
-        let task = command_task(task_id, ecosystem, &command);
-        let batch = OperationBatch {
-            batch_id: Uuid::new_v4(),
-            ecosystem,
-            tasks: vec![task],
-            created_at: Utc::now().timestamp(),
-        };
-        let _ = database.create_batch(&batch);
-    }
-    emit_state(ecosystem, "running", &sink);
-    emit_progress(task_id, ecosystem, TaskStatus::Running, None, &sink);
+    *sequence += 1;
+    emit_state(ecosystem, "running", *sequence, &sink);
+    emit_progress(
+        task_id,
+        ecosystem,
+        *sequence,
+        TaskStatus::Running,
+        None,
+        &sink,
+    );
     if let Some(database) = &database {
         let _ = database.update_task(task_id, TaskStatus::Running, None);
     }
@@ -78,14 +77,19 @@ pub(crate) async fn run_command(
             Err(error) => (TaskStatus::Failed, Some(error)),
         }
     };
-    emit_progress(task_id, ecosystem, status, error, &sink);
+    *sequence += 1;
+    emit_progress(task_id, ecosystem, *sequence, status, error, &sink);
     if let Some(database) = &database {
         let _ = database.update_task(task_id, status, error);
     }
     emit_state(ecosystem, "idle", &sink);
 }
 
-fn command_task(task_id: Uuid, ecosystem: Ecosystem, command: &WorkerCommand) -> PackageTask {
+pub(crate) fn command_task(
+    task_id: Uuid,
+    ecosystem: Ecosystem,
+    command: &WorkerCommand,
+) -> PackageTask {
     let (name, operation) = match command {
         WorkerCommand::Scan(_) => ("*".to_owned(), Operation::Scan),
         WorkerCommand::RefreshDiskUsage(_) => ("*".to_owned(), Operation::MeasureDisk),
@@ -103,9 +107,10 @@ fn command_task(task_id: Uuid, ecosystem: Ecosystem, command: &WorkerCommand) ->
     }
 }
 
-fn emit_state(ecosystem: Ecosystem, state: &str, sink: &WorkerEventSink) {
+fn emit_state(ecosystem: Ecosystem, state: &str, sequence: u64, sink: &WorkerEventSink) {
     sink(WorkerEvent::WorkerState {
         ecosystem,
+        sequence,
         state: state.to_owned(),
         emitted_at: Utc::now().timestamp(),
     });
@@ -114,6 +119,7 @@ fn emit_state(ecosystem: Ecosystem, state: &str, sink: &WorkerEventSink) {
 fn emit_progress(
     task_id: Uuid,
     ecosystem: Ecosystem,
+    sequence: u64,
     status: TaskStatus,
     error: Option<TaskErrorKind>,
     sink: &WorkerEventSink,
@@ -121,7 +127,14 @@ fn emit_progress(
     sink(WorkerEvent::TaskProgress {
         task_id,
         ecosystem,
+        sequence,
         status,
+        completed: u64::from(matches!(
+            status,
+            TaskStatus::Succeeded | TaskStatus::Failed | TaskStatus::Cancelled
+        )),
+        total: 1,
+        message: None,
         error,
         emitted_at: Utc::now().timestamp(),
     });

@@ -4,7 +4,7 @@ mod worker;
 
 pub use messages::WorkerCommand;
 pub use supervisor::{
-    resource_lock_key, Result, SupervisorContext, WorkerContext, WorkerSupervisor,
+    resource_lock_key, ResourceLock, Result, SupervisorContext, WorkerContext, WorkerSupervisor,
 };
 pub use worker::{EcosystemAdapter, NoopAdapter};
 
@@ -18,13 +18,18 @@ pub type TaskId = Uuid;
 pub enum WorkerEvent {
     WorkerState {
         ecosystem: Ecosystem,
+        sequence: u64,
         state: String,
         emitted_at: i64,
     },
     TaskProgress {
         task_id: Uuid,
         ecosystem: Ecosystem,
+        sequence: u64,
         status: TaskStatus,
+        completed: u64,
+        total: u64,
+        message: Option<String>,
         error: Option<TaskErrorKind>,
         emitted_at: i64,
     },
