@@ -1,4 +1,5 @@
 pub mod core;
+pub mod executor;
 pub mod persistence;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
