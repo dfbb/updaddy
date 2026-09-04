@@ -32,3 +32,11 @@
 - Scheduler 启动后台调度钩子并提供 catch-up 检查；唤醒监听安装时确保调度器启动。
 
 验证：`cargo test --manifest-path src-tauri/Cargo.toml --lib`（53 项通过）、`cargo check`、`git diff --check`。
+
+## Fix2（2026-09-04）
+- Scheduler 增加运行回调、周期状态与定时触发，支持 catch-up。
+- 托盘菜单改为固定 id、模板图标，并提供刷新入口与动态更新数量。
+- EventBus 磁盘事件使用快照版本，批次摘要写入日志，数据库错误记录。
+- 设置保存增加 weekly 计划格式校验。
+
+验证：`cargo test --manifest-path src-tauri/Cargo.toml`（53+ 测试通过）。
