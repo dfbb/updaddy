@@ -25,13 +25,34 @@ pub struct OutputEvent {
 }
 
 /// The command contract shared by all ecosystem adapters.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CommandSpec {
     pub program: String,
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
     pub cwd: Option<PathBuf>,
     pub stdin: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for CommandSpec {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let env = self
+            .env
+            .keys()
+            .map(|key| (key.as_str(), "<redacted>"))
+            .collect::<HashMap<_, _>>();
+        formatter
+            .debug_struct("CommandSpec")
+            .field("program", &self.program)
+            .field("args", &self.args)
+            .field("env", &env)
+            .field("cwd", &self.cwd)
+            .field(
+                "stdin",
+                &self.stdin.as_ref().map(|v| format!("<{} bytes>", v.len())),
+            )
+            .finish()
+    }
 }
 
 impl CommandSpec {
@@ -284,6 +305,18 @@ pub fn sink() -> EventSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_spec_debug_redacts_proxy_environment() {
+        let mut spec = CommandSpec::for_test("tool", &[]);
+        spec.env.insert(
+            "ALL_PROXY".into(),
+            "socks5://alice:secret@example.test:1080".into(),
+        );
+        let rendered = format!("{spec:?}");
+        assert!(!rendered.contains("secret"));
+        assert!(!rendered.contains("socks5://"));
+    }
 
     #[tokio::test]
     async fn command_result_captures_stdout_and_exit_code() {

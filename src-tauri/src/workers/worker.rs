@@ -13,11 +13,20 @@ use crate::core::{
 };
 use crate::disk_usage::{CacheStore, DiskUsageError, DiskUsageService, PackageInstallPaths};
 use crate::persistence::Database;
+use crate::proxy::ProxyError;
 
 use super::messages::WorkerCommand;
 use super::{WorkerEvent, WorkerEventSink};
 
 pub use crate::adapters::EcosystemAdapter;
+
+/// 将代理运行时错误映射到现有 worker 重试语义；配置错误保持不可重试。
+pub(crate) fn classify_proxy_error(error: ProxyError) -> TaskErrorKind {
+    match error {
+        ProxyError::InvalidConfig | ProxyError::ProxyUnsupported => TaskErrorKind::InvalidInput,
+        ProxyError::ProxyUnavailable | ProxyError::BridgeFailed => TaskErrorKind::ProxyDisconnected,
+    }
+}
 
 /// Adapter used when a worker has no implementation yet.
 pub struct NoopAdapter;

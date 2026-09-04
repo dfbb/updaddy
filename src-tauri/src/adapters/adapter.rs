@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -9,52 +8,9 @@ use tokio_util::sync::CancellationToken;
 use crate::core::{Ecosystem, Operation, PackageRecord, PackageTask, ResourceKind, TaskErrorKind};
 use crate::disk_usage::{resolve_package_paths, PackageInstallPaths};
 use crate::executor::{sink, CommandResult, CommandSpec, ProcessError, ProcessSupervisor};
+use crate::proxy::is_proxy_env_key;
+pub use crate::proxy::ProxyEnv;
 use crate::workers::WorkerCommand;
-
-/// Environment variables injected by the proxy runtime. Values are never put in argv.
-#[derive(Clone, Default, PartialEq, Eq)]
-pub struct ProxyEnv {
-    pub vars: HashMap<String, String>,
-}
-
-impl fmt::Debug for ProxyEnv {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let redacted = self
-            .vars
-            .keys()
-            .map(|key| (key.as_str(), "<redacted>"))
-            .collect::<HashMap<_, _>>();
-        formatter
-            .debug_struct("ProxyEnv")
-            .field("vars", &redacted)
-            .finish()
-    }
-}
-
-impl ProxyEnv {
-    pub fn new(vars: impl IntoIterator<Item = (String, String)>) -> Self {
-        Self {
-            vars: vars
-                .into_iter()
-                .filter(|(key, _)| is_proxy_env_key(key))
-                .collect(),
-        }
-    }
-}
-
-fn is_proxy_env_key(key: &str) -> bool {
-    matches!(
-        key,
-        "ALL_PROXY"
-            | "all_proxy"
-            | "HTTP_PROXY"
-            | "http_proxy"
-            | "HTTPS_PROXY"
-            | "https_proxy"
-            | "NO_PROXY"
-            | "no_proxy"
-    )
-}
 
 #[async_trait]
 pub trait CommandRunner: Send + Sync {
