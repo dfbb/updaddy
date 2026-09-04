@@ -39,6 +39,8 @@ pub enum SupervisorError {
     Unavailable(Ecosystem),
     #[error("task {0} is not active")]
     UnknownTask(Uuid),
+    #[error("task {0} is already active")]
+    DuplicateTask(Uuid),
 }
 
 pub type Result<T> = std::result::Result<T, SupervisorError>;
@@ -211,6 +213,9 @@ impl WorkerSupervisor {
             .ecosystem()
             .ok_or(SupervisorError::Unavailable(Ecosystem::Homebrew))?;
         let id = command.task_id().unwrap_or_else(Uuid::new_v4);
+        if self.cancellations.lock().unwrap().contains_key(&id) {
+            return Err(SupervisorError::DuplicateTask(id));
+        }
         let cancel = CancellationToken::new();
         let sender = self
             .senders
@@ -263,10 +268,11 @@ impl WorkerSupervisor {
             .cloned()
             .ok_or(SupervisorError::UnknownTask(task_id))?;
         token.cancel();
-        if let Some(database) = &self.database {
-            let _ = database.update_task(task_id, TaskStatus::Cancelled, None);
-        }
         Ok(())
+    }
+
+    pub fn active_task_count(&self) -> usize {
+        self.cancellations.lock().unwrap().len()
     }
 }
 

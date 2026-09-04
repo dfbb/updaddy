@@ -51,6 +51,7 @@ pub(crate) async fn run_command(
 ) {
     *sequence += 1;
     emit_state(ecosystem, "running", *sequence, &sink);
+    *sequence += 1;
     emit_progress(
         task_id,
         ecosystem,
@@ -60,10 +61,10 @@ pub(crate) async fn run_command(
         &sink,
     );
     if let Some(database) = &database {
-        if database
-            .update_task(task_id, TaskStatus::Running, None)
-            .is_err()
-        {
+        if !matches!(
+            database.update_task(task_id, TaskStatus::Running, None),
+            Ok(true)
+        ) {
             *sequence += 1;
             emit_progress(
                 task_id,
@@ -73,6 +74,8 @@ pub(crate) async fn run_command(
                 Some(TaskErrorKind::Unknown),
                 &sink,
             );
+            *sequence += 1;
+            emit_state(ecosystem, "idle", *sequence, &sink);
             return;
         }
     }
@@ -94,7 +97,7 @@ pub(crate) async fn run_command(
     *sequence += 1;
     emit_progress(task_id, ecosystem, *sequence, status, error, &sink);
     if let Some(database) = &database {
-        if database.update_task(task_id, status, error).is_err() {
+        if !matches!(database.update_task(task_id, status, error), Ok(true)) {
             *sequence += 1;
             emit_progress(
                 task_id,
@@ -138,10 +141,12 @@ mod tests {
 
     #[tokio::test]
     async fn noop_adapter_is_explicitly_unavailable() {
-        let result = NoopAdapter.run(
-            WorkerCommand::Scan(Ecosystem::Homebrew),
-            CancellationToken::new(),
-        ).await;
+        let result = NoopAdapter
+            .run(
+                WorkerCommand::Scan(Ecosystem::Homebrew),
+                CancellationToken::new(),
+            )
+            .await;
         assert!(matches!(result, Err(TaskErrorKind::Unknown)));
     }
 }
