@@ -6,7 +6,9 @@ use tokio_util::sync::CancellationToken;
 use crate::core::{Ecosystem, PackageRecord, PackageTask, ResourceKind, TaskErrorKind};
 use crate::executor::{CommandResult, CommandSpec};
 
-use super::adapter::{command, package_record, validate_name, EcosystemAdapter, ExecutorContext};
+use super::adapter::{
+    command, home_path, package_record, validate_name, EcosystemAdapter, ExecutorContext,
+};
 use super::parsers::lines;
 
 #[derive(Debug, Clone, Default)]
@@ -58,6 +60,15 @@ impl EcosystemAdapter for HomebrewAdapter {
         Ecosystem::Homebrew
     }
 
+    async fn run_with_context(
+        &self,
+        context: &ExecutorContext,
+        command: crate::workers::WorkerCommand,
+        cancel: CancellationToken,
+    ) -> Result<(), TaskErrorKind> {
+        self.execute_worker_command(context, command, cancel).await
+    }
+
     async fn detect(&self, context: &ExecutorContext) -> Result<bool, TaskErrorKind> {
         match context
             .run(command("brew", ["--version"]), CancellationToken::new())
@@ -70,23 +81,34 @@ impl EcosystemAdapter for HomebrewAdapter {
     }
 
     async fn scan(&self, context: &ExecutorContext) -> Result<Vec<PackageRecord>, TaskErrorKind> {
+        self.scan_with_cancel(context, CancellationToken::new())
+            .await
+    }
+
+    async fn scan_with_cancel(
+        &self,
+        context: &ExecutorContext,
+        cancel: CancellationToken,
+    ) -> Result<Vec<PackageRecord>, TaskErrorKind> {
         let formula = self
             .run(
                 context,
                 command("brew", ["outdated", "--formula"]),
-                CancellationToken::new(),
+                cancel.clone(),
             )
             .await?;
         let cask = self
             .run(
                 context,
                 command("brew", ["outdated", "--cask"]),
-                CancellationToken::new(),
+                cancel.clone(),
             )
             .await?;
-        let taps = self
-            .run(context, command("brew", ["tap"]), CancellationToken::new())
+        // Homebrew refreshes tap metadata through `brew update`; keep its output out of package rows.
+        let _tap_refresh = self
+            .run(context, command("brew", ["update"]), cancel.clone())
             .await?;
+        let taps = self.run(context, command("brew", ["tap"]), cancel).await?;
         let mut records = Vec::new();
         for name in lines(&formula.stdout) {
             records.push(package_record(
@@ -163,7 +185,7 @@ impl EcosystemAdapter for HomebrewAdapter {
             PathBuf::from("/usr/local/Cellar"),
             PathBuf::from("/opt/homebrew/Caskroom"),
             PathBuf::from("/usr/local/Caskroom"),
-            PathBuf::from("~/Library/Caches/Homebrew/downloads"),
+            home_path("~/Library/Caches/Homebrew/downloads"),
             PathBuf::from("/opt/homebrew/Library/Taps"),
             PathBuf::from("/usr/local/Homebrew/Library/Taps"),
         ]

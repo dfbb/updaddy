@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -52,6 +52,23 @@ pub struct ExecutorContext {
     runner: Arc<dyn CommandRunner>,
 }
 
+pub fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+pub fn home_path(path: impl AsRef<Path>) -> PathBuf {
+    let path = path.as_ref();
+    if path == Path::new("~") {
+        home_dir()
+    } else if let Ok(stripped) = path.strip_prefix("~/") {
+        home_dir().join(stripped)
+    } else {
+        path.to_path_buf()
+    }
+}
+
 impl Default for ExecutorContext {
     fn default() -> Self {
         Self::new()
@@ -102,6 +119,22 @@ pub trait EcosystemAdapter: Send + Sync + 'static {
 
     async fn scan(&self, _context: &ExecutorContext) -> Result<Vec<PackageRecord>, TaskErrorKind> {
         Err(TaskErrorKind::Unknown)
+    }
+
+    async fn scan_with_cancel(
+        &self,
+        context: &ExecutorContext,
+        cancel: CancellationToken,
+    ) -> Result<Vec<PackageRecord>, TaskErrorKind> {
+        if cancel.is_cancelled() {
+            return Err(TaskErrorKind::CommandFailed);
+        }
+        let result = self.scan(context).await;
+        if cancel.is_cancelled() {
+            Err(TaskErrorKind::CommandFailed)
+        } else {
+            result
+        }
     }
 
     /// Build one argv-only command. Names are validated before they reach a command runner.
@@ -159,33 +192,74 @@ pub trait EcosystemAdapter: Send + Sync + 'static {
     /// Compatibility bridge for the Task 5 worker queue.
     async fn run(
         &self,
+        _command: WorkerCommand,
+        _cancel: CancellationToken,
+    ) -> Result<(), TaskErrorKind> {
+        Err(TaskErrorKind::Unknown)
+    }
+
+    async fn run_with_context(
+        &self,
+        context: &ExecutorContext,
         command: WorkerCommand,
         cancel: CancellationToken,
     ) -> Result<(), TaskErrorKind> {
-        let context = ExecutorContext::new();
+        self.execute_worker_command(context, command, cancel).await
+    }
+
+    async fn execute_worker_command(
+        &self,
+        context: &ExecutorContext,
+        command: WorkerCommand,
+        cancel: CancellationToken,
+    ) -> Result<(), TaskErrorKind> {
         match command {
             WorkerCommand::Scan(ecosystem) => {
                 if ecosystem != self.ecosystem() {
                     return Err(TaskErrorKind::InvalidInput);
                 }
-                self.scan(&context).await.map(|_| ())
+                self.scan_with_cancel(context, cancel).await.map(|_| ())
             }
-            WorkerCommand::Update(task) => self.execute(&context, &task, cancel).await,
-            WorkerCommand::Uninstall(task) => self.uninstall(&context, &task, cancel).await,
-            WorkerCommand::RefreshDiskUsage(_) | WorkerCommand::Shutdown => Ok(()),
+            WorkerCommand::Update(task) => self.execute(context, &task, cancel).await,
+            WorkerCommand::Uninstall(task) => self.uninstall(context, &task, cancel).await,
+            WorkerCommand::RefreshDiskUsage(_) => Err(TaskErrorKind::Unknown),
+            WorkerCommand::Shutdown => Ok(()),
         }
     }
+}
+
+pub async fn execute_worker_command(
+    adapter: &dyn EcosystemAdapter,
+    context: &ExecutorContext,
+    command: WorkerCommand,
+    cancel: CancellationToken,
+) -> Result<(), TaskErrorKind> {
+    adapter
+        .execute_worker_command(context, command, cancel)
+        .await
 }
 
 pub fn validate_name(name: &str) -> Result<(), TaskErrorKind> {
     if name.is_empty()
         || name.len() > 256
         || name.starts_with('-')
+        || name.contains('\\')
+        || name.contains("://")
         || name.chars().any(|c| c.is_ascii_whitespace() || c == '\0')
         || name == "."
         || name == ".."
     {
         return Err(TaskErrorKind::InvalidInput);
+    }
+    if name.contains('/') {
+        if name.starts_with('/')
+            || name.ends_with('/')
+            || name
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == "..")
+        {
+            return Err(TaskErrorKind::InvalidInput);
+        }
     }
     Ok(())
 }
@@ -212,11 +286,13 @@ pub fn package_record(
 
 pub fn classify_command_error(result: &CommandResult) -> TaskErrorKind {
     let text = format!("{}\n{}", result.stderr, result.stdout).to_ascii_lowercase();
-    if text.contains("timed out")
-        || text.contains("timeout")
-        || text.contains("could not resolve")
+    if text.contains("connection timed out")
+        || text.contains("connect timeout")
+        || text.contains("operation timed out")
+        || text.contains("network timeout")
+        || text.contains("could not resolve host")
         || text.contains("temporary failure in name resolution")
-        || text.contains("dns")
+        || text.contains("name or service not known")
     {
         return TaskErrorKind::NetworkTimeout;
     }
@@ -228,13 +304,20 @@ pub fn classify_command_error(result: &CommandResult) -> TaskErrorKind {
     {
         return TaskErrorKind::ProxyDisconnected;
     }
-    if text.contains("http 5")
-        || text.contains("http/1.1 5")
-        || (text.contains(" 500")
-            || text.contains(" 502")
-            || text.contains(" 503")
-            || text.contains(" 504"))
-    {
+    let http_codes = [
+        "500", "501", "502", "503", "504", "505", "506", "507", "508", "509", "510", "511",
+    ];
+    let http_5xx = text.lines().any(|line| {
+        line.contains("http")
+            && http_codes.iter().any(|code| {
+                line.split_whitespace()
+                    .any(|token| token.trim_matches(|c: char| !c.is_ascii_digit()) == *code)
+            })
+    }) || http_codes.iter().any(|code| {
+        text.contains(&format!("{code} service unavailable"))
+            || text.contains(&format!("{code} bad gateway"))
+    });
+    if http_5xx {
         return TaskErrorKind::HttpServerTemporaryError;
     }
     if text.contains("permission denied") || text.contains("eacces") {
@@ -292,10 +375,15 @@ mod tests {
             TaskErrorKind::HttpServerTemporaryError
         );
         assert_eq!(
+            classify_command_error(&result("HTTP error 503 Service Unavailable")),
+            TaskErrorKind::HttpServerTemporaryError
+        );
+        assert_eq!(
             classify_command_error(&result("permission denied")),
             TaskErrorKind::PermissionDenied
         );
         assert!(!classify_command_error(&result("invalid option")).is_retryable());
+        assert!(!classify_command_error(&result("request timeout setting")).is_retryable());
     }
 
     #[test]

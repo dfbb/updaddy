@@ -4,6 +4,7 @@ use chrono::Utc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::adapters::ExecutorContext;
 use crate::core::{Ecosystem, Operation, PackageTask, TaskErrorKind, TaskStatus};
 use crate::persistence::Database;
 
@@ -26,6 +27,7 @@ pub(crate) async fn run_command(
     sink: WorkerEventSink,
     database: Option<Arc<Database>>,
     sequence: &mut u64,
+    executor: ExecutorContext,
 ) {
     *sequence += 1;
     emit_state(ecosystem, "running", *sequence, &sink);
@@ -61,7 +63,9 @@ pub(crate) async fn run_command(
     let result = if cancel.is_cancelled() {
         Err(TaskErrorKind::CommandFailed)
     } else {
-        adapter.run(command, cancel.clone()).await
+        adapter
+            .run_with_context(&executor, command, cancel.clone())
+            .await
     };
 
     let (status, error) = if cancel.is_cancelled() {

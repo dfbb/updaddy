@@ -6,6 +6,7 @@ use tokio::runtime::Builder;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::adapters::ExecutorContext;
 use crate::core::Ecosystem;
 use crate::core::{OperationBatch, TaskStatus};
 use crate::persistence::Database;
@@ -19,6 +20,7 @@ pub struct SupervisorContext {
     pub adapters: HashMap<Ecosystem, Arc<dyn EcosystemAdapter>>,
     pub database: Option<Arc<Database>>,
     pub event_sink: WorkerEventSink,
+    pub executor: ExecutorContext,
 }
 
 pub type WorkerContext = SupervisorContext;
@@ -29,6 +31,7 @@ impl SupervisorContext {
             adapters: HashMap::new(),
             database: None,
             event_sink,
+            executor: ExecutorContext::new(),
         }
     }
 }
@@ -72,6 +75,7 @@ impl WorkerSupervisor {
                 .unwrap_or_else(|| Arc::new(NoopAdapter));
             let sink = context.event_sink.clone();
             let database = context.database.clone();
+            let executor = context.executor.clone();
             let active = cancellations.clone();
             let lock = shared_resource_lock(resource_lock_key(ecosystem));
             context.event_sink(WorkerEvent::WorkerState {
@@ -155,6 +159,7 @@ impl WorkerSupervisor {
                             sink.clone(),
                             database.clone(),
                             &mut sequence,
+                            executor.clone(),
                         ))
                     }));
                     if result.is_err() {
@@ -374,6 +379,7 @@ mod tests {
     use tokio::time::sleep;
 
     use super::super::{WorkerEvent, WorkerEventSink};
+    use crate::adapters::ExecutorContext;
     use crate::core::{Operation, PackageTask, TaskErrorKind, TaskStatus};
 
     #[derive(Clone)]
@@ -441,6 +447,14 @@ mod tests {
             self.barrier.wait();
             Ok(())
         }
+        async fn run_with_context(
+            &self,
+            _context: &ExecutorContext,
+            command: WorkerCommand,
+            cancel: CancellationToken,
+        ) -> std::result::Result<(), TaskErrorKind> {
+            self.run(command, cancel).await
+        }
     }
 
     struct DelayedAdapter {
@@ -460,6 +474,14 @@ mod tests {
                 sleep(Duration::from_millis(5)).await;
             }
             Ok(())
+        }
+        async fn run_with_context(
+            &self,
+            _context: &ExecutorContext,
+            command: WorkerCommand,
+            cancel: CancellationToken,
+        ) -> std::result::Result<(), TaskErrorKind> {
+            self.run(command, cancel).await
         }
     }
 
@@ -489,6 +511,7 @@ mod tests {
             adapters,
             database: None,
             event_sink: events.sink(),
+            executor: crate::adapters::ExecutorContext::new(),
         });
         let brew = supervisor
             .submit(WorkerCommand::Scan(Ecosystem::Homebrew))
@@ -519,6 +542,7 @@ mod tests {
             adapters,
             database: None,
             event_sink: events.sink(),
+            executor: crate::adapters::ExecutorContext::new(),
         });
         let first = supervisor
             .submit(WorkerCommand::Update(package_task(Ecosystem::Pip, "a")))
@@ -551,6 +575,7 @@ mod tests {
             adapters,
             database: None,
             event_sink: events.sink(),
+            executor: crate::adapters::ExecutorContext::new(),
         });
         let task = supervisor
             .submit(WorkerCommand::Update(package_task(

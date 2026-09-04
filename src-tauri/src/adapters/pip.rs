@@ -6,7 +6,9 @@ use tokio_util::sync::CancellationToken;
 use crate::core::{Ecosystem, Operation, PackageRecord, PackageTask, ResourceKind, TaskErrorKind};
 use crate::executor::{CommandResult, CommandSpec};
 
-use super::adapter::{command, package_record, validate_name, EcosystemAdapter, ExecutorContext};
+use super::adapter::{
+    command, home_path, package_record, validate_name, EcosystemAdapter, ExecutorContext,
+};
 use super::parsers::json_array_versions;
 
 #[derive(Debug, Clone, Default)]
@@ -18,9 +20,36 @@ impl PipAdapter {
 
     pub async fn discover_install_paths(
         &self,
-        _context: &ExecutorContext,
+        context: &ExecutorContext,
     ) -> Result<Vec<PathBuf>, TaskErrorKind> {
-        Ok(<Self as EcosystemAdapter>::install_paths(self))
+        let result = context
+            .run(
+                command(
+                    "python",
+                    [
+                        "-c",
+                        "import site; print('\\n'.join(site.getsitepackages()))",
+                    ],
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .map_err(|_| TaskErrorKind::CommandFailed)?;
+        if !result.status.success() {
+            return Err(self.classify_error(&result));
+        }
+        let paths: Vec<PathBuf> = result
+            .stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(PathBuf::from)
+            .collect();
+        if paths.is_empty() {
+            Err(TaskErrorKind::CommandFailed)
+        } else {
+            Ok(paths)
+        }
     }
 }
 
@@ -28,6 +57,14 @@ impl PipAdapter {
 impl EcosystemAdapter for PipAdapter {
     fn ecosystem(&self) -> Ecosystem {
         Ecosystem::Pip
+    }
+    async fn run_with_context(
+        &self,
+        context: &ExecutorContext,
+        command: crate::workers::WorkerCommand,
+        cancel: CancellationToken,
+    ) -> Result<(), TaskErrorKind> {
+        self.execute_worker_command(context, command, cancel).await
     }
     async fn detect(&self, context: &ExecutorContext) -> Result<bool, TaskErrorKind> {
         match context
@@ -43,10 +80,19 @@ impl EcosystemAdapter for PipAdapter {
         }
     }
     async fn scan(&self, context: &ExecutorContext) -> Result<Vec<PackageRecord>, TaskErrorKind> {
+        self.scan_with_cancel(context, CancellationToken::new())
+            .await
+    }
+
+    async fn scan_with_cancel(
+        &self,
+        context: &ExecutorContext,
+        cancel: CancellationToken,
+    ) -> Result<Vec<PackageRecord>, TaskErrorKind> {
         let installed = context
             .run(
                 command("python", ["-m", "pip", "list", "--format=json"]),
-                CancellationToken::new(),
+                cancel.clone(),
             )
             .await
             .map_err(|_| TaskErrorKind::CommandFailed)?;
@@ -59,7 +105,7 @@ impl EcosystemAdapter for PipAdapter {
                     "python",
                     ["-m", "pip", "list", "--outdated", "--format=json"],
                 ),
-                CancellationToken::new(),
+                cancel,
             )
             .await
             .map_err(|_| TaskErrorKind::CommandFailed)?;
@@ -112,7 +158,11 @@ impl EcosystemAdapter for PipAdapter {
         Ok(command("python", args))
     }
     fn install_paths(&self) -> Vec<PathBuf> {
-        vec![PathBuf::from("python-site-packages")]
+        vec![
+            home_path("~/.local/lib/python/site-packages"),
+            PathBuf::from("/usr/local/lib/python3/site-packages"),
+            PathBuf::from("/opt/homebrew/lib/python3/site-packages"),
+        ]
     }
     fn classify_error(&self, result: &CommandResult) -> TaskErrorKind {
         super::adapter::classify_command_error(result)

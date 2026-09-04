@@ -7,6 +7,16 @@ pub fn json_object_versions(value: &str) -> Result<Vec<(String, String, Option<S
         .ok_or_else(|| "expected JSON object".to_owned())?;
     let mut rows = Vec::new();
     for (name, entry) in object {
+        let Some(entry) = entry.as_object() else {
+            return Err("expected package metadata object".to_owned());
+        };
+        let has_version = entry.get("version").and_then(Value::as_str).is_some()
+            || entry.get("current").and_then(Value::as_str).is_some()
+            || entry.get("latest").and_then(Value::as_str).is_some()
+            || entry.get("wanted").and_then(Value::as_str).is_some();
+        if !has_version {
+            return Err("missing package version metadata".to_owned());
+        }
         let current = entry
             .get("version")
             .and_then(Value::as_str)

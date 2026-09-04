@@ -6,7 +6,9 @@ use tokio_util::sync::CancellationToken;
 use crate::core::{Ecosystem, Operation, PackageRecord, PackageTask, ResourceKind, TaskErrorKind};
 use crate::executor::{CommandResult, CommandSpec};
 
-use super::adapter::{command, package_record, validate_name, EcosystemAdapter, ExecutorContext};
+use super::adapter::{
+    command, home_path, package_record, validate_name, EcosystemAdapter, ExecutorContext,
+};
 use super::parsers::lines;
 
 #[derive(Debug, Clone, Default)]
@@ -29,6 +31,14 @@ impl EcosystemAdapter for RustupAdapter {
     fn ecosystem(&self) -> Ecosystem {
         Ecosystem::Rustup
     }
+    async fn run_with_context(
+        &self,
+        context: &ExecutorContext,
+        command: crate::workers::WorkerCommand,
+        cancel: CancellationToken,
+    ) -> Result<(), TaskErrorKind> {
+        self.execute_worker_command(context, command, cancel).await
+    }
     async fn detect(&self, context: &ExecutorContext) -> Result<bool, TaskErrorKind> {
         match context
             .run(command("rustup", ["--version"]), CancellationToken::new())
@@ -40,12 +50,26 @@ impl EcosystemAdapter for RustupAdapter {
         }
     }
     async fn scan(&self, context: &ExecutorContext) -> Result<Vec<PackageRecord>, TaskErrorKind> {
-        let toolchains = self.list(context, &["toolchain", "list"]).await?;
+        self.scan_with_cancel(context, CancellationToken::new())
+            .await
+    }
+    async fn scan_with_cancel(
+        &self,
+        context: &ExecutorContext,
+        cancel: CancellationToken,
+    ) -> Result<Vec<PackageRecord>, TaskErrorKind> {
+        let toolchains = self
+            .list(context, &["toolchain", "list"], cancel.clone())
+            .await?;
         let components = self
-            .list(context, &["component", "list", "--installed"])
+            .list(
+                context,
+                &["component", "list", "--installed"],
+                cancel.clone(),
+            )
             .await?;
         let targets = self
-            .list(context, &["target", "list", "--installed"])
+            .list(context, &["target", "list", "--installed"], cancel)
             .await?;
         let mut records = Vec::new();
         for line in lines(&toolchains) {
@@ -109,10 +133,7 @@ impl EcosystemAdapter for RustupAdapter {
         Ok(command("rustup", args))
     }
     fn install_paths(&self) -> Vec<PathBuf> {
-        vec![
-            PathBuf::from("~/.rustup/toolchains"),
-            PathBuf::from("~/.rustup/toolchains/*/lib/rustlib"),
-        ]
+        vec![home_path("~/.rustup/toolchains")]
     }
     fn classify_error(&self, result: &CommandResult) -> TaskErrorKind {
         super::adapter::classify_command_error(result)
@@ -124,9 +145,10 @@ impl RustupAdapter {
         &self,
         context: &ExecutorContext,
         args: &[&str],
+        cancel: CancellationToken,
     ) -> Result<String, TaskErrorKind> {
         let result = context
-            .run(command("rustup", args), CancellationToken::new())
+            .run(command("rustup", args), cancel)
             .await
             .map_err(|_| TaskErrorKind::CommandFailed)?;
         if result.status.success() {
