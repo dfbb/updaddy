@@ -20,13 +20,12 @@ fn redact_bearer(text: &str) -> String {
     let mut cursor = 0;
     while let Some(offset) = find_ascii_case_insensitive(&text[cursor..], "bearer") {
         let start = cursor + offset;
-        if start > 0
-            && !text[..start]
-                .chars()
-                .next_back()
-                .map(char::is_whitespace)
-                .unwrap_or(false)
-        {
+        let previous_is_word = text[..start]
+            .chars()
+            .next_back()
+            .map(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            .unwrap_or(false);
+        if previous_is_word {
             out.push_str(&text[cursor..start + 6]);
             cursor = start + 6;
             continue;
@@ -40,12 +39,16 @@ fn redact_bearer(text: &str) -> String {
             .sum::<usize>();
         out.push_str(&text[token_start..token_start + ows_len]);
         let token = &text[token_start + ows_len..];
-        let token_len = token.find(char::is_whitespace).unwrap_or(token.len());
+        let token_len = token.find(is_token_delimiter).unwrap_or(token.len());
         out.push_str("[REDACTED]");
         cursor = token_start + ows_len + token_len;
     }
     out.push_str(&text[cursor..]);
     out
+}
+
+fn is_token_delimiter(ch: char) -> bool {
+    ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | ')' | ']' | '}')
 }
 
 fn redact_socks_password(text: &str) -> String {
@@ -117,6 +120,16 @@ mod tests {
         assert_eq!(
             redacted,
             "BEARER\t[REDACTED] SOCKS5H://user:[REDACTED]@example.test"
+        );
+    }
+
+    #[test]
+    fn redactor_handles_json_and_parenthesized_bearer_tokens() {
+        let text = r#"{"auth":"Bearer abc"} (Bearer abc) NotBearer abc"#;
+        let redacted = Redactor::redact(text, &[]);
+        assert_eq!(
+            redacted,
+            r#"{"auth":"Bearer [REDACTED]"} (Bearer [REDACTED]) NotBearer abc"#
         );
     }
 }

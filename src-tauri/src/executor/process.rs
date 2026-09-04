@@ -9,6 +9,7 @@ use chrono::Utc;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
+use tokio::task::JoinHandle;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
@@ -153,15 +154,13 @@ impl ProcessSupervisor {
             _ = cancel_token.cancelled() => {
                 terminate_process_group(&mut child).await;
                 if let Some(task) = stdin_task { task.abort(); }
-                let _ = stdout_task.await;
-                let _ = stderr_task.await;
+                let _ = tokio::join!(reap_reader(stdout_task), reap_reader(stderr_task));
                 return Err(ProcessError::Cancelled);
             }
             _ = time::sleep(timeout) => {
                 terminate_process_group(&mut child).await;
                 if let Some(task) = stdin_task { task.abort(); }
-                let _ = stdout_task.await;
-                let _ = stderr_task.await;
+                let _ = tokio::join!(reap_reader(stdout_task), reap_reader(stderr_task));
                 return Err(ProcessError::ProcessTimeout);
             }
         };
@@ -169,12 +168,8 @@ impl ProcessSupervisor {
         if let Some(task) = stdin_task {
             task.abort();
         }
-        let stdout = stdout_task
-            .await
-            .map_err(|e| ProcessError::Io(io::Error::other(e)))??;
-        let stderr = stderr_task
-            .await
-            .map_err(|e| ProcessError::Io(io::Error::other(e)))??;
+        let (stdout, stderr) =
+            tokio::try_join!(reap_reader(stdout_task), reap_reader(stderr_task))?;
         let secret_refs: Vec<&str> = result_secrets.iter().map(String::as_str).collect();
         let stdout = Redactor::redact(&stdout, &secret_refs);
         let stderr = Redactor::redact(&stderr, &secret_refs);
@@ -195,7 +190,7 @@ async fn read_output<R: AsyncRead + Unpin>(
     secrets: Vec<String>,
 ) -> Result<String, io::Error> {
     let mut bytes = Vec::new();
-    let mut pending = String::new();
+    let mut pending = Vec::new();
     let mut chunk = [0_u8; 4096];
     loop {
         let count = reader.read(&mut chunk).await?;
@@ -203,17 +198,40 @@ async fn read_output<R: AsyncRead + Unpin>(
             break;
         }
         bytes.extend_from_slice(&chunk[..count]);
-        pending.push_str(&String::from_utf8_lossy(&chunk[..count]));
-        while let Some(newline) = pending.find('\n') {
-            let line = pending[..newline].trim_end_matches('\r').to_owned();
+        pending.extend_from_slice(&chunk[..count]);
+        while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+            let mut line = pending.drain(..=newline).collect::<Vec<_>>();
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            let line = String::from_utf8_lossy(&line);
             emit_line(&line, stream, &event_sink, &secrets);
-            pending.drain(..=newline);
         }
     }
     if !pending.is_empty() {
-        emit_line(&pending, stream, &event_sink, &secrets);
+        let line = String::from_utf8_lossy(&pending);
+        emit_line(&line, stream, &event_sink, &secrets);
     }
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+async fn reap_reader(
+    mut task: JoinHandle<Result<String, io::Error>>,
+) -> Result<String, ProcessError> {
+    match time::timeout(Duration::from_secs(3), &mut task).await {
+        Ok(joined) => joined
+            .map_err(|error| ProcessError::Io(io::Error::other(error)))?
+            .map_err(ProcessError::Io),
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            Err(ProcessError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "output reader cleanup timed out",
+            )))
+        }
+    }
 }
 
 fn emit_line(line: &str, stream: &str, event_sink: &EventSink, secrets: &[String]) {
@@ -237,12 +255,12 @@ async fn terminate_process_group(child: &mut Child) {
             unsafe {
                 libc::kill(-(pid as i32), libc::SIGKILL);
             }
-            let _ = child.kill().await;
+            let _ = time::timeout(Duration::from_secs(1), child.kill()).await;
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = child.kill().await;
+        let _ = time::timeout(Duration::from_secs(1), child.kill()).await;
     }
 }
 
@@ -320,5 +338,25 @@ mod tests {
             vec!["one", "two"]
         );
         assert!(events.iter().all(|event| event.stream == "stdout"));
+    }
+
+    #[tokio::test]
+    async fn output_reader_preserves_utf8_split_across_chunks() {
+        let (mut writer, reader) = tokio::io::duplex(16);
+        let write_task = tokio::spawn(async move {
+            writer.write_all(&[b'c', 0xc3]).await.unwrap();
+            writer.write_all(&[0xa9, b'\n']).await.unwrap();
+        });
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collected = events.clone();
+        let event_sink: EventSink = Arc::new(move |event| {
+            collected.lock().unwrap().push(event);
+        });
+        let output = read_output(reader, "stdout", event_sink, Vec::new())
+            .await
+            .unwrap();
+        write_task.await.unwrap();
+        assert_eq!(output, "café\n");
+        assert_eq!(events.lock().unwrap()[0].text, "café");
     }
 }
