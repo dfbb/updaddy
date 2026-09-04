@@ -1,4 +1,6 @@
-use updaddy_lib::adapters::{EcosystemAdapter, NpmAdapter, PipAdapter};
+use updaddy_lib::adapters::{
+    EcosystemAdapter, GemAdapter, HomebrewAdapter, NpmAdapter, PipAdapter, RustupAdapter,
+};
 use updaddy_lib::core::{Ecosystem, Operation, PackageTask};
 
 #[test]
@@ -25,4 +27,60 @@ fn pip_uninstall_never_uses_shell_or_sudo() {
         .args
         .iter()
         .any(|arg| arg == "sudo" || arg.contains(";")));
+}
+
+#[test]
+fn homebrew_cask_and_tap_use_dedicated_commands() {
+    let cask = PackageTask::new(Ecosystem::Homebrew, "cask:firefox", Operation::Uninstall);
+    assert_eq!(
+        HomebrewAdapter::new()
+            .plan(&cask)
+            .unwrap()
+            .args
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["uninstall", "--cask", "firefox"]
+    );
+    let tap = PackageTask::new(Ecosystem::Homebrew, "tap:acme/tools", Operation::Uninstall);
+    assert_eq!(
+        HomebrewAdapter::new()
+            .plan(&tap)
+            .unwrap()
+            .args
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["untap", "acme/tools"]
+    );
+}
+
+#[test]
+fn gem_version_and_rustup_resource_are_argv_values() {
+    let gem = PackageTask::new(Ecosystem::Gem, "rails@7.1.0", Operation::Uninstall);
+    assert_eq!(
+        GemAdapter::new()
+            .plan(&gem)
+            .unwrap()
+            .args
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["uninstall", "rails", "--version", "7.1.0"]
+    );
+    let target = PackageTask::new(
+        Ecosystem::Rustup,
+        "target:wasm32-unknown-unknown",
+        Operation::Uninstall,
+    );
+    assert_eq!(
+        RustupAdapter::new()
+            .plan(&target)
+            .unwrap()
+            .args
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["target", "remove", "wasm32-unknown-unknown"]
+    );
 }

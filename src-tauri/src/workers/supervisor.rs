@@ -6,7 +6,7 @@ use tokio::runtime::Builder;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::adapters::ExecutorContext;
+use crate::adapters::{default_adapters, ExecutorContext};
 use crate::core::Ecosystem;
 use crate::core::{OperationBatch, TaskStatus};
 use crate::persistence::Database;
@@ -28,7 +28,7 @@ pub type WorkerContext = SupervisorContext;
 impl SupervisorContext {
     pub fn new(event_sink: WorkerEventSink) -> Self {
         Self {
-            adapters: HashMap::new(),
+            adapters: default_adapters(),
             database: None,
             event_sink,
             executor: ExecutorContext::new(),
