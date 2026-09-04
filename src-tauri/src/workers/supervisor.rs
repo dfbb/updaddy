@@ -219,10 +219,15 @@ impl WorkerSupervisor {
         if self.active_task_count() > 0 {
             return Err(SupervisorError::BatchInProgress);
         }
-        commands.into_iter().map(|command| self.submit(command)).collect()
+        commands
+            .into_iter()
+            .map(|command| self.submit(command))
+            .collect()
     }
 
-    pub fn is_batch_active(&self) -> bool { self.active_task_count() > 0 }
+    pub fn is_batch_active(&self) -> bool {
+        self.active_task_count() > 0
+    }
 
     pub fn submit(&self, command: WorkerCommand) -> Result<Uuid> {
         if matches!(command, WorkerCommand::Shutdown) {
