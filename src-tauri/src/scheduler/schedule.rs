@@ -1,5 +1,5 @@
 use chrono::{Datelike, Local, NaiveDate, NaiveTime, TimeZone, Weekday};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::thread;
 use std::time::Duration;
 
@@ -142,11 +142,13 @@ impl EnabledEcosystems {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Scheduler {
     pub schedule: Schedule,
     config_version: String,
     started: Arc<AtomicBool>,
+    state: Arc<Mutex<SchedulerState>>,
+    runner: Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>,
 }
 
 impl Scheduler {
@@ -155,6 +157,8 @@ impl Scheduler {
             schedule,
             config_version: "v1".into(),
             started: Arc::new(AtomicBool::new(false)),
+            state: Arc::new(Mutex::new(SchedulerState::default())),
+            runner: Arc::new(Mutex::new(None)),
         }
     }
     pub fn with_config_version(schedule: Schedule, version: impl Into<String>) -> Self {
@@ -162,18 +166,33 @@ impl Scheduler {
             schedule,
             config_version: version.into(),
             started: Arc::new(AtomicBool::new(false)),
+            state: Arc::new(Mutex::new(SchedulerState::default())),
+            runner: Arc::new(Mutex::new(None)),
+        }
+    }
+    pub fn set_runner(&self, runner: impl Fn() + Send + Sync + 'static) {
+        *self.runner.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(runner));
+    }
+    pub fn trigger(&self) {
+        let now = chrono::Utc::now().timestamp();
+        let cycle = self.cycle_id(now);
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if CatchUp::should_run(&cycle, now, &state, &self.schedule) {
+            *state = state.record_cycle(cycle);
+            if let Some(run) = self.runner.lock().unwrap_or_else(|p| p.into_inner()).clone() { run(); }
         }
     }
     pub fn start(&self) {
         if self.started.swap(true, Ordering::AcqRel) { return; }
         let schedule = self.schedule.clone();
         let started = self.started.clone();
+        let this = self.clone();
         thread::spawn(move || {
             while started.load(Ordering::Acquire) {
                 let now = chrono::Utc::now().timestamp();
                 let wait = schedule.next_due(now).saturating_sub(now).max(1) as u64;
                 thread::sleep(Duration::from_secs(wait.min(60)));
-                if wait <= 60 { break; }
+                if wait <= 60 { this.trigger(); }
             }
         });
     }

@@ -54,10 +54,28 @@ impl EventBus {
                 }
                 WorkerEvent::PackageChanged { package, .. } => database.save_snapshot(package),
                 WorkerEvent::DiskUsage { ecosystem, package_id, disk_usage, .. } => {
-                    let entry = crate::persistence::DiskUsageCacheEntry { ecosystem: format!("{ecosystem:?}"), package_id: package_id.clone(), installed_version: String::new(), install_root: String::new(), path_signature: String::new(), bytes: disk_usage.bytes, status: disk_usage.status, scanned_at: chrono::Utc::now().timestamp() };
+                    let snapshot = match database.load_snapshot(package_id) {
+                        Ok(value) => value,
+                        Err(err) => {
+                            let _ = database.append_log(&LogEntry { message: format!("event persistence failed: {err}"), emitted_at: chrono::Utc::now().timestamp(), stream: "error".into() });
+                            None
+                        }
+                    };
+                    let entry = crate::persistence::DiskUsageCacheEntry {
+                        ecosystem: serde_json::to_value(ecosystem).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_else(|| format!("{ecosystem:?}")),
+                        package_id: package_id.clone(),
+                        installed_version: snapshot.and_then(|s| s.current_version).unwrap_or_else(|| "unknown".into()),
+                        install_root: "unknown".into(),
+                        path_signature: String::new(),
+                        bytes: disk_usage.bytes,
+                        status: disk_usage.status,
+                        scanned_at: chrono::Utc::now().timestamp(),
+                    };
                     database.upsert_disk_usage(&entry)
                 }
-                WorkerEvent::BatchSummary { batch_id, ecosystem, total, .. } => database.save_scheduler_state(&format!("batch:{batch_id}"), &format!("{ecosystem:?}:{total}")),
+                WorkerEvent::BatchSummary { batch_id, ecosystem, total, succeeded, failed, cancelled, .. } => {
+                    database.append_log(&LogEntry { message: format!("batch {batch_id} {ecosystem:?}: total={total} succeeded={succeeded} failed={failed} cancelled={cancelled}"), emitted_at: chrono::Utc::now().timestamp(), stream: "batch-summary".into() })
+                }
             };
             if let Err(err) = result { let _ = database.append_log(&LogEntry { message: format!("event persistence failed: {err}"), emitted_at: chrono::Utc::now().timestamp(), stream: "error".into() }); }
         }

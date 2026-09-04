@@ -250,7 +250,16 @@ pub fn get_settings(app: State<'_, AppState>) -> Result<Settings, String> {
 pub fn save_settings(app: State<'_, AppState>, settings: Settings) -> Result<(), String> {
     if !matches!(settings.theme.as_str(), "system"|"light"|"dark") { return Err("主题无效".into()); }
     if settings.locale.trim().is_empty() || settings.visible_ecosystems.is_empty() { return Err("设置无效".into()); }
-    if let Some(schedule) = &settings.schedule { if !schedule.is_empty() && crate::scheduler::Schedule::daily(schedule).is_err() { return Err("计划时间无效".into()); } }
+    if let Some(schedule) = &settings.schedule {
+        if !schedule.is_empty() {
+            let valid = if let Some((day, time)) = schedule.strip_prefix("weekly:").and_then(|s| s.split_once(' ')) {
+                crate::scheduler::Schedule::weekly(day, time).is_ok()
+            } else if let Some((day, time)) = schedule.split_once(' ') {
+                crate::scheduler::Schedule::weekly(day, time).is_ok()
+            } else { crate::scheduler::Schedule::daily(schedule).is_ok() };
+            if !valid { return Err("计划时间无效".into()); }
+        }
+    }
     if let Some(db) = &app.database { db.save_setting("settings", &serde_json::to_string(&settings).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?; }
     *app.settings.lock().unwrap_or_else(|p| p.into_inner()) = settings;
     Ok(())
