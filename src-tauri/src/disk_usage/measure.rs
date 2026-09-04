@@ -451,7 +451,7 @@ fn is_python_metadata_dir(path: &Path) -> bool {
 fn complete_record_paths(root: &Path, contents: &str) -> Option<Vec<PathBuf>> {
     let mut paths = Vec::new();
     for line in contents.lines() {
-        let relative = csv_first_field(line)?;
+        let relative = parse_record_path(line.strip_suffix('\r').unwrap_or(line))?;
         if relative.as_os_str().is_empty() || relative.is_absolute() {
             return None;
         }
@@ -497,24 +497,67 @@ fn normalize_python_name(name: &str) -> String {
     normalized
 }
 
-fn csv_first_field(line: &str) -> Option<PathBuf> {
-    if let Some(mut rest) = line.strip_prefix('"') {
-        let mut value = String::new();
-        loop {
-            let quote = rest.find('"')?;
-            value.push_str(&rest[..quote]);
-            rest = &rest[quote + 1..];
-            if let Some(next) = rest.strip_prefix('"') {
-                value.push('"');
-                rest = next;
-            } else {
-                return rest.starts_with(',').then(|| PathBuf::from(value));
-            }
+fn parse_record_path(line: &str) -> Option<PathBuf> {
+    #[derive(Clone, Copy)]
+    enum State {
+        Start,
+        Unquoted,
+        Quoted,
+        AfterQuote,
+    }
+
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut state = State::Start;
+    let mut characters = line.chars().peekable();
+    while let Some(character) = characters.next() {
+        match state {
+            State::Start => match character {
+                ',' => fields.push(String::new()),
+                '"' => state = State::Quoted,
+                '\r' | '\n' => return None,
+                _ => {
+                    field.push(character);
+                    state = State::Unquoted;
+                }
+            },
+            State::Unquoted => match character {
+                ',' => {
+                    fields.push(std::mem::take(&mut field));
+                    state = State::Start;
+                }
+                '"' | '\r' | '\n' => return None,
+                _ => field.push(character),
+            },
+            State::Quoted => match character {
+                '"' => {
+                    if characters.peek() == Some(&'"') {
+                        characters.next();
+                        field.push('"');
+                    } else {
+                        state = State::AfterQuote;
+                    }
+                }
+                '\r' | '\n' => return None,
+                _ => field.push(character),
+            },
+            State::AfterQuote => match character {
+                ',' => {
+                    fields.push(std::mem::take(&mut field));
+                    state = State::Start;
+                }
+                _ => return None,
+            },
         }
     }
-    Some(PathBuf::from(
-        line.split_once(',').map_or(line, |(field, _)| field),
-    ))
+    if matches!(state, State::Quoted) {
+        return None;
+    }
+    fields.push(field);
+    if fields.len() < 3 || fields[3..].iter().any(|field| !field.is_empty()) {
+        return None;
+    }
+    fields.into_iter().next().map(PathBuf::from)
 }
 
 #[cfg(test)]
@@ -652,6 +695,40 @@ mod tests {
 
         assert!(!paths.measurable);
         assert!(paths.paths.is_empty());
+    }
+
+    #[test]
+    fn pip_record_rejects_malformed_csv_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("demo_pkg")).unwrap();
+        fs::write(directory.path().join("demo_pkg/data.py"), b"1234").unwrap();
+        for row in [
+            "demo_pkg/data.py",
+            "demo_pkg/data.py,",
+            "\"demo_pkg/data.py,,",
+            "\"demo_pkg/data.py\"unterminated,,",
+            "demo_pkg/data.py,,,unexpected",
+        ] {
+            assert!(
+                complete_record_paths(directory.path(), row).is_none(),
+                "malformed RECORD row was accepted: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pip_record_accepts_quoted_paths_and_escaped_quotes() {
+        let directory = tempfile::tempdir().unwrap();
+        let relative = "demo_pkg/data,\"quoted\".py";
+        let path = directory.path().join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"1234").unwrap();
+
+        let row = "\"demo_pkg/data,\"\"quoted\"\".py\",,";
+        assert_eq!(
+            complete_record_paths(directory.path(), row),
+            Some(vec![path])
+        );
     }
 
     #[test]
