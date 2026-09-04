@@ -80,6 +80,51 @@ impl Database {
             .transpose()
     }
 
+    pub fn find_snapshot(&self, ecosystem: Ecosystem, name: &str) -> Result<Option<PackageRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT payload_json FROM package_snapshots WHERE ecosystem = ?1 ORDER BY id",
+        )?;
+        let snapshots = stmt.query_map(params![enum_name(&ecosystem)?], |row| {
+            row.get::<_, String>(0)
+        })?;
+        for snapshot in snapshots {
+            let snapshot: PackageRecord = serde_json::from_str(&snapshot?)?;
+            if snapshot.name == name {
+                return Ok(Some(snapshot));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn reconcile_snapshots(
+        &self,
+        ecosystem: Ecosystem,
+        retained_ids: &[String],
+    ) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let ecosystem_name = enum_name(&ecosystem)?;
+        let mut stmt = tx.prepare("SELECT id FROM package_snapshots WHERE ecosystem = ?1")?;
+        let existing = stmt
+            .query_map(params![ecosystem_name], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+        let stale = existing
+            .into_iter()
+            .filter(|id| !retained_ids.iter().any(|retained| retained == id))
+            .collect::<Vec<_>>();
+        for id in &stale {
+            tx.execute(
+                "DELETE FROM disk_usage_cache WHERE ecosystem = ?1 AND package_id = ?2",
+                params![ecosystem_name, id],
+            )?;
+            tx.execute("DELETE FROM package_snapshots WHERE id = ?1", params![id])?;
+        }
+        tx.commit()?;
+        Ok(stale.len() as u64)
+    }
+
     pub fn upsert_disk_usage(&self, entry: &DiskUsageCacheEntry) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
@@ -101,24 +146,49 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT ecosystem,package_id,installed_version,install_root,path_signature,bytes,status,scanned_at FROM disk_usage_cache WHERE ecosystem=?1 AND package_id=?2 AND installed_version=?3 AND install_root=?4")?;
         let mut rows = stmt.query(params![ecosystem, package_id, version, root])?;
-        let value = rows
-            .next()?
-            .map(|r| {
-                Ok(DiskUsageCacheEntry {
-                    ecosystem: r.get(0)?,
-                    package_id: r.get(1)?,
-                    installed_version: r.get(2)?,
-                    install_root: r.get(3)?,
-                    path_signature: r.get(4)?,
-                    bytes: u64::try_from(r.get::<_, i64>(5)?).map_err(|_| {
-                        PersistenceError::InvalidValue("disk usage bytes cannot be negative".into())
-                    })?,
-                    status: parse_status(&r.get::<_, String>(6)?)?,
-                    scanned_at: r.get(7)?,
-                })
-            })
-            .transpose()?;
-        Ok(value)
+        rows.next()?.map(read_disk_usage_entry).transpose()
+    }
+
+    pub fn find_disk_usage_for_package(
+        &self,
+        ecosystem: &str,
+        package_id: &str,
+        version: &str,
+    ) -> Result<Option<DiskUsageCacheEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT ecosystem,package_id,installed_version,install_root,path_signature,bytes,status,scanned_at FROM disk_usage_cache WHERE ecosystem=?1 AND package_id=?2 AND installed_version=?3 ORDER BY scanned_at DESC LIMIT 1")?;
+        let mut rows = stmt.query(params![ecosystem, package_id, version])?;
+        rows.next()?.map(read_disk_usage_entry).transpose()
+    }
+
+    pub fn delete_disk_usage(&self, ecosystem: Ecosystem, package_id: &str) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let changed = tx.execute(
+            "DELETE FROM disk_usage_cache WHERE ecosystem = ?1 AND package_id = ?2",
+            params![enum_name(&ecosystem)?, package_id],
+        )? as u64;
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    pub fn delete_snapshot_and_disk_usage(
+        &self,
+        ecosystem: Ecosystem,
+        package_id: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM disk_usage_cache WHERE ecosystem = ?1 AND package_id = ?2",
+            params![enum_name(&ecosystem)?, package_id],
+        )?;
+        tx.execute(
+            "DELETE FROM package_snapshots WHERE id = ?1",
+            params![package_id],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn create_batch(&self, batch: &OperationBatch) -> Result<()> {
@@ -303,6 +373,21 @@ impl Database {
 fn insert_task(tx: &rusqlite::Transaction<'_>, batch_id: Uuid, task: &PackageTask) -> Result<()> {
     tx.execute("INSERT INTO package_tasks(task_id,batch_id,ecosystem,name,operation,status,error) VALUES (?1,?2,?3,?4,?5,?6,?7)", params![task.task_id.to_string(), batch_id.to_string(), enum_name(&task.ecosystem)?, task.name, enum_name(&task.operation)?, enum_name(&task.status)?, task.error.as_ref().map(enum_name).transpose()?])?;
     Ok(())
+}
+
+fn read_disk_usage_entry(row: &rusqlite::Row<'_>) -> Result<DiskUsageCacheEntry> {
+    Ok(DiskUsageCacheEntry {
+        ecosystem: row.get(0)?,
+        package_id: row.get(1)?,
+        installed_version: row.get(2)?,
+        install_root: row.get(3)?,
+        path_signature: row.get(4)?,
+        bytes: u64::try_from(row.get::<_, i64>(5)?).map_err(|_| {
+            PersistenceError::InvalidValue("disk usage bytes cannot be negative".into())
+        })?,
+        status: parse_status(&row.get::<_, String>(6)?)?,
+        scanned_at: row.get(7)?,
+    })
 }
 
 fn parse_status(s: &str) -> Result<DiskUsageStatus> {

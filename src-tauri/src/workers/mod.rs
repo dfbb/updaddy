@@ -8,7 +8,7 @@ pub use supervisor::{
 };
 pub use worker::{EcosystemAdapter, NoopAdapter};
 
-use crate::core::{Ecosystem, TaskErrorKind, TaskStatus};
+use crate::core::{DiskUsage, Ecosystem, PackageRecord, TaskErrorKind, TaskStatus};
 use serde::Serialize;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -32,6 +32,21 @@ pub enum WorkerEvent {
         total: u64,
         message: Option<String>,
         error: Option<TaskErrorKind>,
+        emitted_at: i64,
+    },
+    PackageChanged {
+        task_id: Uuid,
+        ecosystem: Ecosystem,
+        sequence: u64,
+        package: PackageRecord,
+        emitted_at: i64,
+    },
+    DiskUsage {
+        task_id: Uuid,
+        ecosystem: Ecosystem,
+        sequence: u64,
+        package_id: String,
+        disk_usage: DiskUsage,
         emitted_at: i64,
     },
 }

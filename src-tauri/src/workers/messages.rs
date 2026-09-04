@@ -1,6 +1,6 @@
 use uuid::Uuid;
 
-use crate::core::{Ecosystem, PackageTask};
+use crate::core::{Ecosystem, PackageRecord, PackageTask};
 
 /// Commands accepted by an ecosystem worker.
 #[derive(Debug, Clone)]
@@ -8,14 +8,15 @@ pub enum WorkerCommand {
     Scan(Ecosystem),
     Update(PackageTask),
     Uninstall(PackageTask),
-    RefreshDiskUsage(Ecosystem),
+    RefreshDiskUsage(PackageRecord),
     Shutdown,
 }
 
 impl WorkerCommand {
     pub(crate) fn ecosystem(&self) -> Option<Ecosystem> {
         match self {
-            Self::Scan(ecosystem) | Self::RefreshDiskUsage(ecosystem) => Some(*ecosystem),
+            Self::Scan(ecosystem) => Some(*ecosystem),
+            Self::RefreshDiskUsage(package) => Some(package.ecosystem),
             Self::Update(task) | Self::Uninstall(task) => Some(task.ecosystem),
             Self::Shutdown => None,
         }

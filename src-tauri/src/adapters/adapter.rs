@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use crate::core::{Ecosystem, Operation, PackageRecord, PackageTask, ResourceKind, TaskErrorKind};
+use crate::disk_usage::{resolve_package_paths, PackageInstallPaths};
 use crate::executor::{sink, CommandResult, CommandSpec, ProcessError, ProcessSupervisor};
 use crate::workers::WorkerCommand;
 
@@ -255,6 +256,24 @@ pub trait EcosystemAdapter: Send + Sync + 'static {
         _cancel: CancellationToken,
     ) -> Result<Vec<PathBuf>, TaskErrorKind> {
         Ok(self.install_paths())
+    }
+
+    fn package_install_paths(
+        &self,
+        package: &PackageRecord,
+        install_roots: &[PathBuf],
+    ) -> PackageInstallPaths {
+        resolve_package_paths(package, install_roots)
+    }
+
+    async fn resolve_package_install_paths(
+        &self,
+        _context: &ExecutorContext,
+        package: &PackageRecord,
+        install_roots: &[PathBuf],
+        _cancel: CancellationToken,
+    ) -> Result<PackageInstallPaths, TaskErrorKind> {
+        Ok(self.package_install_paths(package, install_roots))
     }
 
     fn classify_error(&self, result: &CommandResult) -> TaskErrorKind {

@@ -180,20 +180,9 @@ impl GemAdapter {
         if !result.status.success() {
             return Err(self.classify_error(&result));
         }
-        let mut paths = lines(&result.stdout).map(home_path).collect::<Vec<_>>();
+        let paths = lines(&result.stdout).map(home_path).collect::<Vec<_>>();
         if paths.is_empty() {
             return Err(TaskErrorKind::CommandFailed);
-        }
-        // Include the specifications directory and its gemspec files for disk accounting.
-        let specifications = paths[0].join("specifications");
-        paths.push(specifications.clone());
-        if let Ok(entries) = std::fs::read_dir(&specifications) {
-            paths.extend(
-                entries
-                    .filter_map(|entry| entry.ok())
-                    .map(|entry| entry.path())
-                    .filter(|path| path.extension().is_some_and(|ext| ext == "gemspec")),
-            );
         }
         Ok(paths)
     }

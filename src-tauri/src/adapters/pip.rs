@@ -30,7 +30,7 @@ impl PipAdapter {
                     "python",
                     [
                         "-c",
-                        "import site; print('\\n'.join(site.getsitepackages()))",
+                        "import site; print('\\n'.join([*site.getsitepackages(), site.getusersitepackages()]))",
                     ],
                 ),
                 cancel,

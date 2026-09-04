@@ -1,5 +1,6 @@
 pub mod adapters;
 pub mod core;
+pub mod disk_usage;
 pub mod executor;
 pub mod persistence;
 pub mod workers;

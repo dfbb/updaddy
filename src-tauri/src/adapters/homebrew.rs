@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use crate::core::{Ecosystem, PackageRecord, PackageTask, ResourceKind, TaskErrorKind};
+use crate::disk_usage::{resolve_package_paths, PackageInstallPaths};
 use crate::executor::{CommandResult, CommandSpec};
 
 use super::adapter::{
@@ -211,9 +212,59 @@ impl EcosystemAdapter for HomebrewAdapter {
         ]
     }
 
+    async fn resolve_package_install_paths(
+        &self,
+        context: &ExecutorContext,
+        package: &PackageRecord,
+        install_roots: &[PathBuf],
+        cancel: CancellationToken,
+    ) -> Result<PackageInstallPaths, TaskErrorKind> {
+        let fallback = resolve_package_paths(package, install_roots);
+        if package.resource_kind != ResourceKind::Cask {
+            return Ok(fallback);
+        }
+        let name = package.name.strip_prefix("cask:").unwrap_or(&package.name);
+        validate_resource_name(Ecosystem::Homebrew, ResourceKind::Cask, name)?;
+        let result = context
+            .run(command("brew", ["list", "--cask", name]), cancel)
+            .await
+            .map_err(|error| classify_process_error(&error))?;
+        if !result.status.success() {
+            return Err(self.classify_error(&result));
+        }
+        Ok(resolve_cask_artifacts(fallback, &result.stdout))
+    }
+
     fn classify_error(&self, result: &CommandResult) -> TaskErrorKind {
         super::adapter::classify_command_error(result)
     }
+}
+
+fn resolve_cask_artifacts(mut fallback: PackageInstallPaths, output: &str) -> PackageInstallPaths {
+    for listed in lines(output)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    {
+        let resolved = std::fs::symlink_metadata(&listed)
+            .ok()
+            .filter(|metadata| metadata.file_type().is_symlink())
+            .and_then(|_| std::fs::read_link(&listed).ok())
+            .map(|target| {
+                if target.is_absolute() {
+                    target
+                } else {
+                    listed
+                        .parent()
+                        .map_or(target.clone(), |parent| parent.join(target))
+                }
+            })
+            .unwrap_or(listed);
+        if resolved.exists() && !fallback.paths.contains(&resolved) {
+            fallback.paths.push(resolved);
+        }
+    }
+    fallback.measurable = fallback.paths.iter().any(|path| path.exists());
+    fallback
 }
 
 fn installed_versions(output: &str) -> impl Iterator<Item = (String, Option<String>)> + '_ {
@@ -284,7 +335,10 @@ fn changed_taps(output: &str) -> std::collections::HashSet<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::outdated_versions;
+    use std::fs;
+
+    use super::{outdated_versions, resolve_cask_artifacts};
+    use crate::disk_usage::{measure_paths, PackageInstallPaths};
 
     #[test]
     fn parses_brew_verbose_formula_and_cask_rows() {
@@ -298,5 +352,32 @@ mod tests {
             cask.get("firefox"),
             Some(&(Some("123.0".into()), Some("124.0".into())))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cask_artifact_resolution_counts_an_explicit_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let cask_root = directory.path().join("Caskroom");
+        let package_root = cask_root.join("demo");
+        let application = directory.path().join("Applications/Demo.app");
+        fs::create_dir_all(&package_root).unwrap();
+        fs::create_dir_all(&application).unwrap();
+        fs::write(application.join("binary"), b"1234").unwrap();
+        let artifact = package_root.join("Demo.app");
+        symlink(&application, &artifact).unwrap();
+        let fallback = PackageInstallPaths {
+            install_root: cask_root,
+            paths: vec![package_root],
+            measurable: true,
+        };
+
+        let resolved =
+            resolve_cask_artifacts(fallback, &format!("{}\n", artifact.to_string_lossy()));
+
+        assert!(resolved.paths.contains(&application));
+        assert_eq!(measure_paths(&resolved.paths).unwrap().bytes, 4);
     }
 }
