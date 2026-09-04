@@ -33,7 +33,42 @@
 - `git diff --check`：通过。
 - `cargo test --manifest-path src-tauri/Cargo.toml persistence:: -- --nocapture`：仍被 registry 阻塞，`objc2-app-kit ^0.6` 在当前索引中不存在（可用版本为 0.3/0.2）；未进入编译和测试阶段。
 
+本轮测试命令的最终输出为：
+
+```text
+error: failed to get `async-trait` as a dependency of package `updaddy v0.1.0 (/Users/dfbb/Sites/updaddy/src-tauri)`
+Caused by: failed to load source for dependency `async-trait`
+Caused by: unable to update registry `crates-io`
+Caused by: failed to query replaced source registry `crates-io`
+Caused by: download of config.json failed
+Caused by: [6] Couldn't resolve host name (Could not resolve host: rsproxy.cn)
+```
+
 ### Fix round 1 concerns
 
 - 由于依赖版本解析阻塞，新增 Rust 测试无法在当前环境运行；依赖索引恢复后应重跑完整持久化测试。
 - 磁盘缓存清理继续保守保留所有缓存行，避免缺少显式引用关系时误删最新缓存。
+
+## Fix round 2
+
+- 新增公开 `TaskAttempt` 结构和参数化 `list_task_attempts(task_id)`，覆盖尝试读取契约并加入回归测试。
+- 清理先删除所有 `finished_at < cutoff` 的 attempts，再删除 cutoff 前 batch 下剩余 attempts、tasks 和 batches，避免近期 batch 中的过期 attempts 永久保留。
+- 磁盘缓存写入使用 `i64::try_from`，超过 SQLite 整数范围时返回 `PersistenceError::InvalidValue`。
+
+### Fix round 2 验证
+
+- `cargo fmt --manifest-path src-tauri/Cargo.toml`：通过。
+- `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check`：通过。
+- `git diff --check`：通过。
+- `cargo test --manifest-path src-tauri/Cargo.toml persistence:: -- --nocapture`：被 registry 网络阻塞，未进入编译阶段。
+
+完整最终错误输出：
+
+```text
+error: failed to get `async-trait` as a dependency of package `updaddy v0.1.0 (/Users/dfbb/Sites/updaddy/src-tauri)`
+Caused by: failed to load source for dependency `async-trait`
+Caused by: unable to update registry `crates-io`
+Caused by: failed to query replaced source registry `crates-io`
+Caused by: download of config.json failed
+Caused by: [6] Couldn't resolve host name (Could not resolve host: rsproxy.cn)
+```

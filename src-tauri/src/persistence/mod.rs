@@ -4,4 +4,4 @@ mod migrations;
 mod repositories;
 
 pub use db::{Database, PersistenceError, Result};
-pub use repositories::DiskUsageCacheEntry;
+pub use repositories::{DiskUsageCacheEntry, TaskAttempt};

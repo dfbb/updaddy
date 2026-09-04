@@ -20,6 +20,15 @@ pub struct DiskUsageCacheEntry {
     pub scanned_at: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskAttempt {
+    pub id: i64,
+    pub attempt: u32,
+    pub status: String,
+    pub started_at: Option<i64>,
+    pub finished_at: Option<i64>,
+}
+
 impl DiskUsageCacheEntry {
     pub fn ready(
         ecosystem: impl Into<String>,
@@ -74,7 +83,10 @@ impl Database {
     pub fn upsert_disk_usage(&self, entry: &DiskUsageCacheEntry) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
-        tx.execute("INSERT INTO disk_usage_cache(ecosystem,package_id,installed_version,install_root,path_signature,bytes,status,scanned_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(ecosystem,package_id,installed_version,install_root) DO UPDATE SET path_signature=excluded.path_signature,bytes=excluded.bytes,status=excluded.status,scanned_at=excluded.scanned_at", params![entry.ecosystem, entry.package_id, entry.installed_version, entry.install_root, entry.path_signature, entry.bytes as i64, enum_name(&entry.status)?, entry.scanned_at])?;
+        let bytes = i64::try_from(entry.bytes).map_err(|_| {
+            PersistenceError::InvalidValue("disk usage bytes exceed SQLite integer range".into())
+        })?;
+        tx.execute("INSERT INTO disk_usage_cache(ecosystem,package_id,installed_version,install_root,path_signature,bytes,status,scanned_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(ecosystem,package_id,installed_version,install_root) DO UPDATE SET path_signature=excluded.path_signature,bytes=excluded.bytes,status=excluded.status,scanned_at=excluded.scanned_at", params![entry.ecosystem, entry.package_id, entry.installed_version, entry.install_root, entry.path_signature, bytes, enum_name(&entry.status)?, entry.scanned_at])?;
         tx.commit()?;
         Ok(())
     }
@@ -254,6 +266,23 @@ impl Database {
         Ok(id)
     }
 
+    pub fn list_task_attempts(&self, task_id: Uuid) -> Result<Vec<TaskAttempt>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id, attempt, status, started_at, finished_at FROM task_attempts WHERE task_id = ?1 ORDER BY attempt, id")?;
+        let attempts = stmt
+            .query_map(params![task_id.to_string()], |row| {
+                Ok(TaskAttempt {
+                    id: row.get(0)?,
+                    attempt: row.get(1)?,
+                    status: row.get(2)?,
+                    started_at: row.get(3)?,
+                    finished_at: row.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(attempts)
+    }
+
     pub fn list_logs(&self) -> Result<Vec<LogEntry>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt =
@@ -284,5 +313,31 @@ fn parse_status(s: &str) -> Result<DiskUsageStatus> {
         _ => Err(PersistenceError::InvalidValue(format!(
             "unknown disk usage status: {s}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::{Ecosystem, Operation, OperationBatch, PackageTask};
+
+    #[test]
+    fn task_attempts_can_be_read_after_recording() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("updaddy.sqlite")).unwrap();
+        let task = PackageTask::new(Ecosystem::Npm, "eslint", Operation::Update);
+        let task_id = task.task_id;
+        let batch = OperationBatch {
+            batch_id: Uuid::new_v4(),
+            ecosystem: Ecosystem::Npm,
+            tasks: vec![task],
+            created_at: 1_700_000_000,
+        };
+        db.create_batch(&batch).unwrap();
+        db.record_task_attempt(task_id, 1, "failed", Some(10), Some(20))
+            .unwrap();
+        let attempts = db.list_task_attempts(task_id).unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].finished_at, Some(20));
     }
 }
