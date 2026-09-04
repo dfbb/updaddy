@@ -490,6 +490,13 @@ pub fn classify_process_error(error: &ProcessError) -> TaskErrorKind {
     }
 }
 
+pub fn detect_process_error(error: &ProcessError) -> Result<bool, TaskErrorKind> {
+    match error {
+        ProcessError::Spawn(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        other => Err(classify_process_error(other)),
+    }
+}
+
 pub fn command(program: &str, args: impl IntoIterator<Item = impl AsRef<str>>) -> CommandSpec {
     CommandSpec {
         program: program.to_owned(),

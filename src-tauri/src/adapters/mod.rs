@@ -11,9 +11,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 pub use adapter::{
-    classify_command_error, classify_process_error, command, home_dir, home_path, package_record,
-    validate_name, validate_resource_name, CommandRunner, EcosystemAdapter, ExecutorContext,
-    ProcessCommandRunner, ProxyEnv,
+    classify_command_error, classify_process_error, command, detect_process_error, home_dir,
+    home_path, package_record, validate_name, validate_resource_name, CommandRunner,
+    EcosystemAdapter, ExecutorContext, ProcessCommandRunner, ProxyEnv,
 };
 pub use gem::GemAdapter;
 pub use homebrew::HomebrewAdapter;

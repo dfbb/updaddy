@@ -7,8 +7,8 @@ use crate::core::{Ecosystem, PackageRecord, PackageTask, ResourceKind, TaskError
 use crate::executor::{CommandResult, CommandSpec};
 
 use super::adapter::{
-    classify_process_error, command, home_path, package_record, validate_resource_name,
-    EcosystemAdapter, ExecutorContext,
+    classify_process_error, command, detect_process_error, home_path, package_record,
+    validate_resource_name, EcosystemAdapter, ExecutorContext,
 };
 use super::parsers::lines;
 
@@ -77,7 +77,7 @@ impl EcosystemAdapter for HomebrewAdapter {
         {
             Ok(result) if result.status.success() => Ok(true),
             Ok(result) => Err(self.classify_error(&result)),
-            Err(_) => Ok(false),
+            Err(error) => detect_process_error(&error),
         }
     }
 
