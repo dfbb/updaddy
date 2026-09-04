@@ -240,9 +240,13 @@ impl WorkerSupervisor {
                 tasks: vec![task],
                 created_at: chrono::Utc::now().timestamp(),
             };
-            database
-                .create_batch(&batch)
-                .map_err(|_| SupervisorError::Unavailable(ecosystem))?;
+            if database.create_batch(&batch).is_err() {
+                self.cancellations
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&id);
+                return Err(SupervisorError::Unavailable(ecosystem));
+            }
         }
         sender
             .send(Envelope {
@@ -306,7 +310,10 @@ impl Drop for WorkerSupervisor {
         }
         // JoinHandle is intentionally dropped after cancellation. Dropping detaches
         // a misbehaving adapter instead of blocking application shutdown forever.
-        self.handles.lock().unwrap().clear();
+        self.handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
     }
 }
 
