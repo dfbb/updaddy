@@ -68,7 +68,7 @@ fn redact_socks_password(text: &str) -> String {
         if let Some(at) = url.find('@') {
             let authority = &url[scheme.len()..at];
             if let Some(colon) = authority.find(':') {
-                out.push_str(scheme);
+                out.push_str(&url[..scheme.len()]);
                 out.push_str(&authority[..colon]);
                 out.push_str(":[REDACTED]@");
                 out.push_str(&url[at + 1..]);
