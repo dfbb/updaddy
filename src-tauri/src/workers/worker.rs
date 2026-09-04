@@ -32,9 +32,9 @@ impl EcosystemAdapter for NoopAdapter {
         cancel: CancellationToken,
     ) -> Result<(), TaskErrorKind> {
         if cancel.is_cancelled() {
-            Err(TaskErrorKind::CommandFailed)
+            Err(TaskErrorKind::Unknown)
         } else {
-            Ok(())
+            Err(TaskErrorKind::Unknown)
         }
     }
 }
@@ -60,7 +60,21 @@ pub(crate) async fn run_command(
         &sink,
     );
     if let Some(database) = &database {
-        let _ = database.update_task(task_id, TaskStatus::Running, None);
+        if database
+            .update_task(task_id, TaskStatus::Running, None)
+            .is_err()
+        {
+            *sequence += 1;
+            emit_progress(
+                task_id,
+                ecosystem,
+                *sequence,
+                TaskStatus::Failed,
+                Some(TaskErrorKind::Unknown),
+                &sink,
+            );
+            return;
+        }
     }
 
     let result = if cancel.is_cancelled() {
@@ -80,9 +94,20 @@ pub(crate) async fn run_command(
     *sequence += 1;
     emit_progress(task_id, ecosystem, *sequence, status, error, &sink);
     if let Some(database) = &database {
-        let _ = database.update_task(task_id, status, error);
+        if database.update_task(task_id, status, error).is_err() {
+            *sequence += 1;
+            emit_progress(
+                task_id,
+                ecosystem,
+                *sequence,
+                TaskStatus::Failed,
+                Some(TaskErrorKind::Unknown),
+                &sink,
+            );
+        }
     }
-    emit_state(ecosystem, "idle", &sink);
+    *sequence += 1;
+    emit_state(ecosystem, "idle", *sequence, &sink);
 }
 
 pub(crate) fn command_task(
@@ -104,6 +129,20 @@ pub(crate) fn command_task(
         operation,
         status: TaskStatus::Pending,
         error: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn noop_adapter_is_explicitly_unavailable() {
+        let result = NoopAdapter.run(
+            WorkerCommand::Scan(Ecosystem::Homebrew),
+            CancellationToken::new(),
+        ).await;
+        assert!(matches!(result, Err(TaskErrorKind::Unknown)));
     }
 }
 

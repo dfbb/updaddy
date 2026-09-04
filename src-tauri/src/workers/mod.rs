@@ -9,12 +9,13 @@ pub use supervisor::{
 pub use worker::{EcosystemAdapter, NoopAdapter};
 
 use crate::core::{Ecosystem, TaskErrorKind, TaskStatus};
+use serde::Serialize;
 use std::sync::Arc;
 use uuid::Uuid;
 
 pub type TaskId = Uuid;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub enum WorkerEvent {
     WorkerState {
         ecosystem: Ecosystem,

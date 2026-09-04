@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 
 use tokio::runtime::Builder;
@@ -71,7 +71,13 @@ impl WorkerSupervisor {
             let sink = context.event_sink.clone();
             let database = context.database.clone();
             let active = cancellations.clone();
-            let lock = Arc::new(ResourceLock::new(resource_lock_key(ecosystem)));
+            let lock = shared_resource_lock(resource_lock_key(ecosystem));
+            context.event_sink(WorkerEvent::WorkerState {
+                ecosystem,
+                sequence: 0,
+                state: "idle".into(),
+                emitted_at: chrono::Utc::now().timestamp(),
+            });
             let handle = thread::spawn(move || {
                 let runtime = Builder::new_current_thread().enable_all().build();
                 let Ok(runtime) = runtime else {
@@ -92,6 +98,27 @@ impl WorkerSupervisor {
                     let command = envelope.command;
                     let cancel = envelope.cancel;
                     if cancel.is_cancelled() {
+                        if let Some(database) = &database {
+                            if database
+                                .update_task(id, TaskStatus::Cancelled, None)
+                                .is_err()
+                            {
+                                sink(WorkerEvent::TaskProgress {
+                                    task_id: id,
+                                    ecosystem,
+                                    sequence: {
+                                        sequence += 1;
+                                        sequence
+                                    },
+                                    status: TaskStatus::Failed,
+                                    completed: 1,
+                                    total: 1,
+                                    message: Some("database update failed".into()),
+                                    error: Some(crate::core::TaskErrorKind::Unknown),
+                                    emitted_at: chrono::Utc::now().timestamp(),
+                                });
+                            }
+                        }
                         sink(WorkerEvent::TaskProgress {
                             task_id: id,
                             ecosystem,
@@ -202,13 +229,18 @@ impl WorkerSupervisor {
                 .create_batch(&batch)
                 .map_err(|_| SupervisorError::Unavailable(ecosystem))?;
         }
+        self.cancellations
+            .lock()
+            .unwrap()
+            .insert(id, cancel.clone());
         sender
             .send(Envelope {
                 id,
                 command,
-                cancel,
+                cancel: cancel.clone(),
             })
             .map_err(|_| {
+                self.cancellations.lock().unwrap().remove(&id);
                 if let Some(database) = &self.database {
                     let _ = database.update_task(
                         id,
@@ -273,6 +305,19 @@ pub struct ResourceLock {
     gate: Mutex<()>,
 }
 
+static RESOURCE_LOCKS: OnceLock<Mutex<HashMap<&'static str, Arc<ResourceLock>>>> = OnceLock::new();
+
+fn shared_resource_lock(key: &'static str) -> Arc<ResourceLock> {
+    let locks = RESOURCE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = locks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .entry(key)
+        .or_insert_with(|| Arc::new(ResourceLock::new(key)))
+        .clone()
+}
+
 impl ResourceLock {
     pub fn new(key: &'static str) -> Self {
         Self {
@@ -285,7 +330,9 @@ impl ResourceLock {
         self.key
     }
     pub fn acquire(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.gate.lock().unwrap()
+        self.gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
