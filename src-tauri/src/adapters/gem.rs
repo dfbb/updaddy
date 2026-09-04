@@ -47,7 +47,7 @@ impl EcosystemAdapter for GemAdapter {
             .run(command("gem", ["outdated"]), CancellationToken::new())
             .await
             .map_err(|_| TaskErrorKind::CommandFailed)?;
-        if !outdated.status.success() && !outdated.stdout.is_empty() {
+        if !outdated.status.success() && outdated.stdout.trim().is_empty() {
             return Err(self.classify_error(&outdated));
         }
         let mut updates = std::collections::HashMap::new();
@@ -131,8 +131,17 @@ impl GemAdapter {
         if paths.is_empty() {
             return Err(TaskErrorKind::CommandFailed);
         }
-        // A gemdir is the root; gemspec files are included for disk accounting by callers.
-        paths.push(paths[0].join("specifications"));
+        // Include the specifications directory and its gemspec files for disk accounting.
+        let specifications = paths[0].join("specifications");
+        paths.push(specifications.clone());
+        if let Ok(entries) = std::fs::read_dir(&specifications) {
+            paths.extend(
+                entries
+                    .filter_map(|entry| entry.ok())
+                    .map(|entry| entry.path())
+                    .filter(|path| path.extension().is_some_and(|ext| ext == "gemspec")),
+            );
+        }
         Ok(paths)
     }
 }

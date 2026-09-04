@@ -54,6 +54,9 @@ impl EcosystemAdapter for NpmAdapter {
             .await
             .map_err(|_| TaskErrorKind::CommandFailed)?;
         // npm exits 1 when outdated packages exist, so parse stdout regardless of status.
+        if !outdated.status.success() && outdated.stdout.trim().is_empty() {
+            return Err(self.classify_error(&outdated));
+        }
         let updates = if outdated.stdout.trim().is_empty() {
             std::collections::HashMap::new()
         } else {
