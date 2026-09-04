@@ -17,27 +17,45 @@ impl Redactor {
 
 fn redact_bearer(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(offset) = rest.find("Bearer ") {
-        out.push_str(&rest[..offset]);
-        out.push_str("Bearer ");
-        let token_start = &rest[offset + "Bearer ".len()..];
-        let token_len = token_start
-            .find(char::is_whitespace)
-            .unwrap_or(token_start.len());
+    let mut cursor = 0;
+    while let Some(offset) = find_ascii_case_insensitive(&text[cursor..], "bearer") {
+        let start = cursor + offset;
+        if start > 0
+            && !text[..start]
+                .chars()
+                .next_back()
+                .map(char::is_whitespace)
+                .unwrap_or(false)
+        {
+            out.push_str(&text[cursor..start + 6]);
+            cursor = start + 6;
+            continue;
+        }
+        out.push_str(&text[cursor..start + 6]);
+        let token_start = start + 6;
+        let ows_len = text[token_start..]
+            .chars()
+            .take_while(|ch| matches!(ch, ' ' | '\t'))
+            .map(char::len_utf8)
+            .sum::<usize>();
+        out.push_str(&text[token_start..token_start + ows_len]);
+        let token = &text[token_start + ows_len..];
+        let token_len = token.find(char::is_whitespace).unwrap_or(token.len());
         out.push_str("[REDACTED]");
-        rest = &token_start[token_len..];
+        cursor = token_start + ows_len + token_len;
     }
-    out.push_str(rest);
+    out.push_str(&text[cursor..]);
     out
 }
 
 fn redact_socks_password(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut cursor = 0;
-    while let Some((relative, scheme)) = ["socks5://", "socks5h://"]
+    while let Some((relative, scheme)) = ["socks5h://", "socks5://"]
         .iter()
-        .filter_map(|scheme| text[cursor..].find(scheme).map(|offset| (offset, *scheme)))
+        .filter_map(|scheme| {
+            find_ascii_case_insensitive(&text[cursor..], scheme).map(|offset| (offset, *scheme))
+        })
         .min_by_key(|(offset, _)| *offset)
     {
         let start = cursor + relative;
@@ -66,6 +84,13 @@ fn redact_socks_password(text: &str) -> String {
     out
 }
 
+fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::Redactor;
@@ -83,5 +108,15 @@ mod tests {
     fn redactor_removes_password_from_unregistered_socks_url() {
         let redacted = Redactor::redact("socks5://u:p@example.test", &[]);
         assert_eq!(redacted, "socks5://u:[REDACTED]@example.test");
+    }
+
+    #[test]
+    fn redactor_handles_case_and_optional_whitespace() {
+        let text = "BEARER\tabc123 SOCKS5H://user:pw@example.test";
+        let redacted = Redactor::redact(text, &[]);
+        assert_eq!(
+            redacted,
+            "BEARER\t[REDACTED] SOCKS5H://user:[REDACTED]@example.test"
+        );
     }
 }

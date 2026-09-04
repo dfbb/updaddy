@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use thiserror::Error;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
@@ -63,8 +63,6 @@ pub enum ProcessError {
     ProcessTimeout,
     #[error("command was cancelled by the user")]
     Cancelled,
-    #[error("command exited unsuccessfully: {0}")]
-    CommandFailed(ExitStatus),
 }
 
 impl ProcessError {
@@ -114,19 +112,18 @@ impl ProcessSupervisor {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        #[cfg(target_os = "macos")]
+        #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
 
         let mut child = command.spawn().map_err(ProcessError::Spawn)?;
-        if let Some(input) = spec.stdin {
-            if let Some(mut stdin) = child.stdin.take() {
-                use tokio::io::AsyncWriteExt;
-                stdin.write_all(&input).await.map_err(ProcessError::Io)?;
-            }
-        }
+        let stdin_task = spec.stdin.and_then(|input| {
+            child.stdin.take().map(|mut stdin| {
+                tokio::spawn(async move { stdin.write_all(&input).await.map_err(ProcessError::Io) })
+            })
+        });
 
         let stdout = child
             .stdout
@@ -136,35 +133,51 @@ impl ProcessSupervisor {
             .stderr
             .take()
             .ok_or_else(|| ProcessError::Io(io::Error::other("stderr unavailable")))?;
-        let stdout_task = tokio::spawn(async move { read_output(stdout).await });
-        let stderr_task = tokio::spawn(async move { read_output(stderr).await });
+        let secrets: Vec<String> = spec
+            .env
+            .values()
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .collect();
+        let result_secrets = secrets.clone();
+        let stdout_task = tokio::spawn(read_output(
+            stdout,
+            "stdout",
+            event_sink.clone(),
+            secrets.clone(),
+        ));
+        let stderr_task = tokio::spawn(read_output(stderr, "stderr", event_sink, secrets));
 
         let status = tokio::select! {
             status = child.wait() => status.map_err(ProcessError::Io)?,
             _ = cancel_token.cancelled() => {
                 terminate_process_group(&mut child).await;
+                if let Some(task) = stdin_task { task.abort(); }
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
                 return Err(ProcessError::Cancelled);
             }
             _ = time::sleep(timeout) => {
                 terminate_process_group(&mut child).await;
+                if let Some(task) = stdin_task { task.abort(); }
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
                 return Err(ProcessError::ProcessTimeout);
             }
         };
 
+        if let Some(task) = stdin_task {
+            task.abort();
+        }
         let stdout = stdout_task
             .await
             .map_err(|e| ProcessError::Io(io::Error::other(e)))??;
         let stderr = stderr_task
             .await
             .map_err(|e| ProcessError::Io(io::Error::other(e)))??;
-        let secret_refs: Vec<&str> = spec
-            .env
-            .values()
-            .filter(|value| !value.is_empty())
-            .map(String::as_str)
-            .collect();
-        let stdout = redact_output(&stdout, "stdout", &event_sink, &secret_refs);
-        let stderr = redact_output(&stderr, "stderr", &event_sink, &secret_refs);
+        let secret_refs: Vec<&str> = result_secrets.iter().map(String::as_str).collect();
+        let stdout = Redactor::redact(&stdout, &secret_refs);
+        let stderr = Redactor::redact(&stderr, &secret_refs);
 
         Ok(CommandResult {
             status,
@@ -175,46 +188,56 @@ impl ProcessSupervisor {
     }
 }
 
-async fn read_output<R: tokio::io::AsyncRead + Unpin>(mut reader: R) -> Result<String, io::Error> {
+async fn read_output<R: AsyncRead + Unpin>(
+    mut reader: R,
+    stream: &str,
+    event_sink: EventSink,
+    secrets: Vec<String>,
+) -> Result<String, io::Error> {
     let mut bytes = Vec::new();
-    reader.read_to_end(&mut bytes).await?;
+    let mut pending = String::new();
+    let mut chunk = [0_u8; 4096];
+    loop {
+        let count = reader.read(&mut chunk).await?;
+        if count == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+        pending.push_str(&String::from_utf8_lossy(&chunk[..count]));
+        while let Some(newline) = pending.find('\n') {
+            let line = pending[..newline].trim_end_matches('\r').to_owned();
+            emit_line(&line, stream, &event_sink, &secrets);
+            pending.drain(..=newline);
+        }
+    }
+    if !pending.is_empty() {
+        emit_line(&pending, stream, &event_sink, &secrets);
+    }
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-fn redact_output(text: &str, stream: &str, event_sink: &EventSink, secrets: &[&str]) -> String {
-    let redacted = Redactor::redact(text, secrets);
-    for line in redacted.lines() {
-        event_sink(OutputEvent {
-            emitted_at: Utc::now().timestamp(),
-            stream: stream.to_owned(),
-            text: line.to_owned(),
-        });
-    }
-    redacted
+fn emit_line(line: &str, stream: &str, event_sink: &EventSink, secrets: &[String]) {
+    let secret_refs: Vec<&str> = secrets.iter().map(String::as_str).collect();
+    event_sink(OutputEvent {
+        emitted_at: Utc::now().timestamp(),
+        stream: stream.to_owned(),
+        text: Redactor::redact(line, &secret_refs),
+    });
 }
 
 async fn terminate_process_group(child: &mut Child) {
     #[cfg(unix)]
     {
         if let Some(pid) = child.id() {
-            #[cfg(target_os = "macos")]
             unsafe {
                 libc::kill(-(pid as i32), libc::SIGTERM);
             }
-            #[cfg(not(target_os = "macos"))]
-            {
-                let _ = child.start_kill();
+            let _ = time::timeout(Duration::from_secs(3), child.wait()).await;
+            // The group may already be gone; SIGKILL is intentionally unconditional.
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
             }
-            if time::timeout(Duration::from_secs(3), child.wait())
-                .await
-                .is_err()
-            {
-                #[cfg(target_os = "macos")]
-                unsafe {
-                    libc::kill(-(pid as i32), libc::SIGKILL);
-                }
-                let _ = child.kill().await;
-            }
+            let _ = child.kill().await;
         }
     }
     #[cfg(not(unix))]
@@ -254,5 +277,23 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(ProcessError::ProcessTimeout)));
+    }
+
+    #[tokio::test]
+    async fn cancellation_does_not_wait_for_blocked_stdin_writer() {
+        let token = CancellationToken::new();
+        let cancel = token.clone();
+        let cancel_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            cancel.cancel();
+        });
+        let mut spec = CommandSpec::for_test("sh", &["-c", "sleep 10"]);
+        spec.stdin = Some(vec![b'x'; 8 * 1024 * 1024]);
+        let started = std::time::Instant::now();
+        let result =
+            ProcessSupervisor::run_with_timeout(spec, token, sink(), Duration::from_secs(5)).await;
+        cancel_task.await.unwrap();
+        assert!(matches!(result, Err(ProcessError::Cancelled)));
+        assert!(started.elapsed() < Duration::from_secs(4));
     }
 }
