@@ -23,25 +23,49 @@ fn redact_bearer(text: &str) -> String {
         let previous_is_word = text[..start]
             .chars()
             .next_back()
-            .map(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            .map(is_word_char)
             .unwrap_or(false);
         if previous_is_word {
             out.push_str(&text[cursor..start + 6]);
             cursor = start + 6;
             continue;
         }
-        out.push_str(&text[cursor..start + 6]);
-        let token_start = start + 6;
-        let ows_len = text[token_start..]
+        let after_scheme = &text[start + 6..];
+        let first_after = after_scheme.chars().next();
+        if first_after.map(is_word_char).unwrap_or(false) {
+            out.push_str(&text[cursor..start + 6]);
+            cursor = start + 6;
+            continue;
+        }
+        let ows_len = after_scheme
             .chars()
             .take_while(|ch| matches!(ch, ' ' | '\t'))
             .map(char::len_utf8)
             .sum::<usize>();
-        out.push_str(&text[token_start..token_start + ows_len]);
-        let token = &text[token_start + ows_len..];
+        let separator_len = if ows_len > 0 {
+            ows_len
+        } else if let Some(ch) = first_after {
+            if is_token_delimiter(ch) {
+                out.push_str(&text[cursor..start + 6]);
+                cursor = start + 6;
+                continue;
+            }
+            ch.len_utf8()
+        } else {
+            out.push_str(&text[cursor..start + 6]);
+            cursor = start + 6;
+            continue;
+        };
+        let token_start = start + 6 + separator_len;
+        out.push_str(&text[cursor..token_start]);
+        let token = &text[token_start..];
         let token_len = token.find(is_token_delimiter).unwrap_or(token.len());
+        if token_len == 0 {
+            cursor = token_start;
+            continue;
+        }
         out.push_str("[REDACTED]");
-        cursor = token_start + ows_len + token_len;
+        cursor = token_start + token_len;
     }
     out.push_str(&text[cursor..]);
     out
@@ -49,6 +73,10 @@ fn redact_bearer(text: &str) -> String {
 
 fn is_token_delimiter(ch: char) -> bool {
     ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | ')' | ']' | '}')
+}
+
+fn is_word_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
 }
 
 fn redact_socks_password(text: &str) -> String {
@@ -130,6 +158,16 @@ mod tests {
         assert_eq!(
             redacted,
             r#"{"auth":"Bearer [REDACTED]"} (Bearer [REDACTED]) NotBearer abc"#
+        );
+    }
+
+    #[test]
+    fn redactor_rejects_bearer_words_without_a_token_boundary() {
+        let text = "BearerX secret Bearerless secret Bearer:abc";
+        let redacted = Redactor::redact(text, &[]);
+        assert_eq!(
+            redacted,
+            "BearerX secret Bearerless secret Bearer:[REDACTED]"
         );
     }
 }

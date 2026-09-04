@@ -191,6 +191,9 @@ async fn read_output<R: AsyncRead + Unpin>(
 ) -> Result<String, io::Error> {
     let mut bytes = Vec::new();
     let mut pending = Vec::new();
+    let has_multiline_secret = secrets
+        .iter()
+        .any(|secret| secret.contains('\n') || secret.contains('\r'));
     let mut chunk = [0_u8; 4096];
     loop {
         let count = reader.read(&mut chunk).await?;
@@ -199,7 +202,10 @@ async fn read_output<R: AsyncRead + Unpin>(
         }
         bytes.extend_from_slice(&chunk[..count]);
         pending.extend_from_slice(&chunk[..count]);
-        while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+        while !has_multiline_secret {
+            let Some(newline) = pending.iter().position(|byte| *byte == b'\n') else {
+                break;
+            };
             let mut line = pending.drain(..=newline).collect::<Vec<_>>();
             line.pop();
             if line.last() == Some(&b'\r') {
@@ -209,7 +215,14 @@ async fn read_output<R: AsyncRead + Unpin>(
             emit_line(&line, stream, &event_sink, &secrets);
         }
     }
-    if !pending.is_empty() {
+    if has_multiline_secret {
+        // A secret may span lines; buffer this stream until EOF so no partial event leaks it.
+        let secret_refs: Vec<&str> = secrets.iter().map(String::as_str).collect();
+        let redacted = Redactor::redact(&String::from_utf8_lossy(&bytes), &secret_refs);
+        for line in redacted.lines() {
+            emit_line(line, stream, &event_sink, &[]);
+        }
+    } else if !pending.is_empty() {
         let line = String::from_utf8_lossy(&pending);
         emit_line(&line, stream, &event_sink, &secrets);
     }
@@ -358,5 +371,31 @@ mod tests {
         write_task.await.unwrap();
         assert_eq!(output, "café\n");
         assert_eq!(events.lock().unwrap()[0].text, "café");
+    }
+
+    #[tokio::test]
+    async fn multiline_secret_never_leaks_in_line_events() {
+        let (mut writer, reader) = tokio::io::duplex(32);
+        let write_task = tokio::spawn(async move {
+            writer.write_all(b"line1\nline2\n").await.unwrap();
+        });
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collected = events.clone();
+        let event_sink: EventSink = Arc::new(move |event| {
+            collected.lock().unwrap().push(event);
+        });
+        let output = read_output(
+            reader,
+            "stdout",
+            event_sink,
+            vec!["line1\nline2".to_owned()],
+        )
+        .await
+        .unwrap();
+        write_task.await.unwrap();
+        assert_eq!(output, "line1\nline2\n");
+        let events = events.lock().unwrap();
+        assert!(!events.iter().any(|event| event.text.contains("line1")));
+        assert!(!events.iter().any(|event| event.text.contains("line2")));
     }
 }
