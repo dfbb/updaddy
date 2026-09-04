@@ -234,10 +234,18 @@ fn outdated_versions(
             let Some((_, rest)) = line.split_once(" (") else {
                 return Some((name, (None, Some("latest".to_owned()))));
             };
-            let body = rest.strip_suffix(')')?.trim();
-            let (current, target) = body.split_once('<')?;
-            let current = current.trim();
-            let target = target.trim();
+            let close = rest.find(')')?;
+            let body = rest[..close].trim();
+            let after = rest[close + 1..].trim();
+            let (current, target) = if let Some((current, target)) = body.split_once('<') {
+                (current.trim(), target.trim())
+            } else {
+                let target = after
+                    .strip_prefix("<")
+                    .or_else(|| after.strip_prefix("!="))
+                    .map(str::trim)?;
+                (body.split(',').next().unwrap_or(body).trim(), target)
+            };
             if target.is_empty() {
                 return None;
             }
@@ -265,4 +273,23 @@ fn changed_taps(output: &str) -> std::collections::HashSet<&str> {
         .map(str::trim)
         .filter(|part| part.contains('/') && !part.contains(' '))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::outdated_versions;
+
+    #[test]
+    fn parses_brew_verbose_formula_and_cask_rows() {
+        let formula = outdated_versions("openssl (3.2.0) < 3.3.0");
+        assert_eq!(
+            formula.get("openssl"),
+            Some(&(Some("3.2.0".into()), Some("3.3.0".into())))
+        );
+        let cask = outdated_versions("firefox (123.0) != 124.0");
+        assert_eq!(
+            cask.get("firefox"),
+            Some(&(Some("123.0".into()), Some("124.0".into())))
+        );
+    }
 }

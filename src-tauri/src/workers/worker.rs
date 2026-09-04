@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::Utc;
 use tokio_util::sync::CancellationToken;
@@ -17,6 +18,51 @@ pub use crate::adapters::EcosystemAdapter;
 pub struct NoopAdapter;
 
 impl EcosystemAdapter for NoopAdapter {}
+
+const MAX_ATTEMPTS: u32 = 3;
+
+async fn run_with_retries(
+    adapter: &dyn EcosystemAdapter,
+    executor: &ExecutorContext,
+    command: WorkerCommand,
+    cancel: CancellationToken,
+    database: Option<&Arc<Database>>,
+    task_id: Uuid,
+) -> Result<(), TaskErrorKind> {
+    let mut attempt = 1_u32;
+    loop {
+        let started_at = Utc::now().timestamp();
+        let result = adapter
+            .run_with_context(executor, command.clone(), cancel.clone())
+            .await;
+        let status = match &result {
+            Ok(()) => "succeeded",
+            Err(_) if cancel.is_cancelled() => "cancelled",
+            Err(error) if error.is_retryable() && attempt < MAX_ATTEMPTS => "retrying",
+            Err(_) => "failed",
+        };
+        if let Some(database) = database {
+            let _ = database.record_task_attempt(
+                task_id,
+                attempt,
+                status,
+                Some(started_at),
+                Some(Utc::now().timestamp()),
+            );
+        }
+        match result {
+            Err(error) if error.is_retryable() && attempt < MAX_ATTEMPTS => {
+                let delay = Duration::from_secs(1_u64 << (attempt - 1));
+                attempt += 1;
+                tokio::select! {
+                    _ = cancel.cancelled() => return Err(TaskErrorKind::CommandFailed),
+                    _ = tokio::time::sleep(delay) => {}
+                }
+            }
+            result => return result,
+        }
+    }
+}
 
 pub(crate) async fn run_command(
     ecosystem: Ecosystem,
@@ -63,9 +109,15 @@ pub(crate) async fn run_command(
     let result = if cancel.is_cancelled() {
         Err(TaskErrorKind::CommandFailed)
     } else {
-        adapter
-            .run_with_context(&executor, command, cancel.clone())
-            .await
+        run_with_retries(
+            adapter.as_ref(),
+            &executor,
+            command,
+            cancel.clone(),
+            database.as_ref(),
+            task_id,
+        )
+        .await
     };
 
     let (status, error) = if cancel.is_cancelled() {
