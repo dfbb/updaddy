@@ -11,12 +11,12 @@ impl Database {
             "DELETE FROM log_entries WHERE emitted_at < ?1",
             params![cutoff],
         )? as u64;
+        removed += tx.execute("DELETE FROM task_attempts WHERE task_id IN (SELECT task_id FROM package_tasks WHERE batch_id IN (SELECT batch_id FROM operation_batches WHERE created_at < ?1))", params![cutoff])? as u64;
+        removed += tx.execute("DELETE FROM package_tasks WHERE batch_id IN (SELECT batch_id FROM operation_batches WHERE created_at < ?1)", params![cutoff])? as u64;
         removed += tx.execute(
-            "DELETE FROM task_attempts WHERE finished_at IS NOT NULL AND finished_at < ?1",
+            "DELETE FROM operation_batches WHERE created_at < ?1",
             params![cutoff],
         )? as u64;
-        removed += tx.execute("DELETE FROM package_tasks WHERE status IN ('succeeded','failed','cancelled','interrupted') AND batch_id IN (SELECT batch_id FROM operation_batches WHERE created_at < ?1)", params![cutoff])? as u64;
-        removed += tx.execute("DELETE FROM operation_batches WHERE created_at < ?1 AND batch_id NOT IN (SELECT batch_id FROM package_tasks)", params![cutoff])? as u64;
         tx.commit()?;
         Ok(removed)
     }
@@ -49,5 +49,24 @@ mod tests {
         let db = Database::open(dir.path().join("updaddy.sqlite")).unwrap();
         db.append_log(&LogEntry::at("old", 1_600_000_000)).unwrap();
         assert_eq!(db.cleanup_before(1_700_000_000).unwrap(), 1);
+    }
+
+    #[test]
+    fn cleanup_removes_old_batch_with_pending_and_running_tasks() {
+        use crate::core::{Ecosystem, Operation, OperationBatch, PackageTask, TaskStatus};
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("updaddy.sqlite")).unwrap();
+        let pending = PackageTask::new(Ecosystem::Npm, "pending", Operation::Update);
+        let mut running = PackageTask::new(Ecosystem::Npm, "running", Operation::Update);
+        running.status = TaskStatus::Running;
+        let batch = OperationBatch {
+            batch_id: uuid::Uuid::new_v4(),
+            ecosystem: Ecosystem::Npm,
+            tasks: vec![pending, running],
+            created_at: 1_600_000_000,
+        };
+        db.create_batch(&batch).unwrap();
+        assert_eq!(db.cleanup_before(1_700_000_000).unwrap(), 3);
+        assert!(db.load_batch(batch.batch_id).unwrap().is_none());
     }
 }

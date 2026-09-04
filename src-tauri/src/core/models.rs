@@ -47,6 +47,7 @@ pub enum DiskUsageStatus {
 pub enum TaskStatus {
     Pending,
     Running,
+    Interrupted,
     Succeeded,
     Failed,
     Cancelled,
@@ -131,6 +132,13 @@ mod tests {
 
         let task = PackageTask::new(Ecosystem::Npm, "typescript", Operation::Uninstall);
         assert_eq!(task.operation, Operation::Uninstall);
+
+        let mut task = PackageTask::new(Ecosystem::Npm, "typescript", Operation::Update);
+        task.status = TaskStatus::Interrupted;
+        assert_eq!(
+            serde_json::to_value(&task).unwrap()["status"],
+            "interrupted"
+        );
     }
 
     #[test]

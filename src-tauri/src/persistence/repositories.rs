@@ -6,7 +6,7 @@ use crate::core::{
     DiskUsageStatus, Ecosystem, LogEntry, OperationBatch, PackageRecord, PackageTask,
 };
 
-use super::db::{Database, Result};
+use super::db::{Database, PersistenceError, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiskUsageCacheEntry {
@@ -48,6 +48,11 @@ fn enum_name<T: serde::Serialize>(v: &T) -> Result<String> {
         .to_owned())
 }
 
+fn parse_enum<T: serde::de::DeserializeOwned>(value: &str, field: &str) -> Result<T> {
+    serde_json::from_str(&format!("\"{value}\""))
+        .map_err(|_| PersistenceError::InvalidValue(format!("unknown {field}: {value}")))
+}
+
 impl Database {
     pub fn save_snapshot(&self, snapshot: &PackageRecord) -> Result<()> {
         let conn = self.conn.lock().unwrap();
@@ -55,6 +60,15 @@ impl Database {
         tx.execute("INSERT INTO package_snapshots(id,ecosystem,payload_json,updated_at) VALUES (?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET ecosystem=excluded.ecosystem,payload_json=excluded.payload_json,updated_at=excluded.updated_at", params![snapshot.id, enum_name(&snapshot.ecosystem)?, serde_json::to_string(snapshot)?, chrono::Utc::now().timestamp()])?;
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn load_snapshot(&self, id: &str) -> Result<Option<PackageRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT payload_json FROM package_snapshots WHERE id = ?1")?;
+        let mut rows = stmt.query(params![id])?;
+        rows.next()?
+            .map(|row| Ok(serde_json::from_str(&row.get::<_, String>(0)?)?))
+            .transpose()
     }
 
     pub fn upsert_disk_usage(&self, entry: &DiskUsageCacheEntry) -> Result<()> {
@@ -84,8 +98,10 @@ impl Database {
                     installed_version: r.get(2)?,
                     install_root: r.get(3)?,
                     path_signature: r.get(4)?,
-                    bytes: r.get::<_, i64>(5)? as u64,
-                    status: parse_status(&r.get::<_, String>(6)?),
+                    bytes: u64::try_from(r.get::<_, i64>(5)?).map_err(|_| {
+                        PersistenceError::InvalidValue("disk usage bytes cannot be negative".into())
+                    })?,
+                    status: parse_status(&r.get::<_, String>(6)?)?,
                     scanned_at: r.get(7)?,
                 })
             })
@@ -145,6 +161,114 @@ impl Database {
         tx.commit()?;
         Ok(())
     }
+
+    pub fn worker_state(&self, ecosystem: Ecosystem) -> Result<Option<(String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT state, updated_at FROM worker_state WHERE ecosystem = ?1")?;
+        let mut rows = stmt.query(params![enum_name(&ecosystem)?])?;
+        rows.next()?
+            .map(|row| Ok((row.get(0)?, row.get(1)?)))
+            .transpose()
+    }
+
+    pub fn load_batch(&self, batch_id: Uuid) -> Result<Option<OperationBatch>> {
+        let conn = self.conn.lock().unwrap();
+        let mut batch_stmt = conn
+            .prepare("SELECT ecosystem, created_at FROM operation_batches WHERE batch_id = ?1")?;
+        let mut batch_rows = batch_stmt.query(params![batch_id.to_string()])?;
+        let Some(batch_row) = batch_rows.next()? else {
+            return Ok(None);
+        };
+        let ecosystem: Ecosystem = parse_enum(&batch_row.get::<_, String>(0)?, "ecosystem")?;
+        let created_at = batch_row.get(1)?;
+        let mut task_stmt = conn.prepare("SELECT task_id, ecosystem, name, operation, status, error FROM package_tasks WHERE batch_id = ?1 ORDER BY rowid")?;
+        let tasks = task_stmt
+            .query_map(params![batch_id.to_string()], |row| {
+                let task_id = row
+                    .get::<_, String>(0)?
+                    .parse::<Uuid>()
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
+                let ecosystem = parse_enum(&row.get::<_, String>(1)?, "ecosystem")
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
+                let operation = parse_enum(&row.get::<_, String>(3)?, "operation")
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
+                let status = parse_enum(&row.get::<_, String>(4)?, "task status")
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
+                let error = row
+                    .get::<_, Option<String>>(5)?
+                    .map(|value| parse_enum(&value, "task error"))
+                    .transpose()
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
+                Ok(PackageTask {
+                    task_id,
+                    ecosystem,
+                    name: row.get(2)?,
+                    operation,
+                    status,
+                    error,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(Some(OperationBatch {
+            batch_id,
+            ecosystem,
+            tasks,
+            created_at,
+        }))
+    }
+
+    pub fn update_task(
+        &self,
+        task_id: Uuid,
+        status: crate::core::TaskStatus,
+        error: Option<crate::core::TaskErrorKind>,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let changed = tx.execute(
+            "UPDATE package_tasks SET status = ?1, error = ?2 WHERE task_id = ?3",
+            params![
+                enum_name(&status)?,
+                error.as_ref().map(enum_name).transpose()?,
+                task_id.to_string()
+            ],
+        )? > 0;
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    pub fn record_task_attempt(
+        &self,
+        task_id: Uuid,
+        attempt: u32,
+        status: &str,
+        started_at: Option<i64>,
+        finished_at: Option<i64>,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("INSERT INTO task_attempts(task_id, attempt, status, started_at, finished_at) VALUES (?1, ?2, ?3, ?4, ?5)", params![task_id.to_string(), attempt, status, started_at, finished_at])?;
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(id)
+    }
+
+    pub fn list_logs(&self) -> Result<Vec<LogEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT message, emitted_at, stream FROM log_entries ORDER BY id")?;
+        let entries = stmt
+            .query_map([], |row| {
+                Ok(LogEntry {
+                    message: row.get(0)?,
+                    emitted_at: row.get(1)?,
+                    stream: row.get(2)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(entries)
+    }
 }
 
 fn insert_task(tx: &rusqlite::Transaction<'_>, batch_id: Uuid, task: &PackageTask) -> Result<()> {
@@ -152,10 +276,13 @@ fn insert_task(tx: &rusqlite::Transaction<'_>, batch_id: Uuid, task: &PackageTas
     Ok(())
 }
 
-fn parse_status(s: &str) -> DiskUsageStatus {
+fn parse_status(s: &str) -> Result<DiskUsageStatus> {
     match s {
-        "measuring" => DiskUsageStatus::Measuring,
-        "unavailable" => DiskUsageStatus::Unavailable,
-        _ => DiskUsageStatus::Ready,
+        "ready" => Ok(DiskUsageStatus::Ready),
+        "measuring" => Ok(DiskUsageStatus::Measuring),
+        "unavailable" => Ok(DiskUsageStatus::Unavailable),
+        _ => Err(PersistenceError::InvalidValue(format!(
+            "unknown disk usage status: {s}"
+        ))),
     }
 }

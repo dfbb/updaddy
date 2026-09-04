@@ -15,6 +15,8 @@ pub enum PersistenceError {
     Io(#[from] std::io::Error),
     #[error("serialization error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("invalid persisted value: {0}")]
+    InvalidValue(String),
 }
 
 pub type Result<T> = std::result::Result<T, PersistenceError>;
@@ -27,7 +29,10 @@ pub struct Database {
 impl Database {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent() {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             fs::create_dir_all(parent)?;
             set_mode(parent, 0o700)?;
         }
@@ -76,4 +81,20 @@ fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn set_mode(_path: &Path, _mode: u32) -> std::io::Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Database;
+
+    #[test]
+    fn open_accepts_path_without_parent_directory() {
+        let file_name = format!("updaddy-persistence-{}.sqlite", std::process::id());
+        let path = std::path::PathBuf::from(&file_name);
+        let db = Database::open(&path).expect("database path without parent should work");
+        drop(db);
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(format!("{file_name}-wal"));
+        let _ = std::fs::remove_file(format!("{file_name}-shm"));
+    }
 }
