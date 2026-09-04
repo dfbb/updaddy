@@ -100,41 +100,43 @@ impl WorkerSupervisor {
                     let command = envelope.command;
                     let cancel = envelope.cancel;
                     if cancel.is_cancelled() {
-                        if let Some(database) = &database {
-                            if database
-                                .update_task(id, TaskStatus::Cancelled, None)
-                                .is_err()
-                            {
-                                sink(WorkerEvent::TaskProgress {
-                                    task_id: id,
-                                    ecosystem,
-                                    sequence: {
-                                        sequence += 1;
-                                        sequence
-                                    },
-                                    status: TaskStatus::Failed,
-                                    completed: 1,
-                                    total: 1,
-                                    message: Some("database update failed".into()),
-                                    error: Some(crate::core::TaskErrorKind::Unknown),
-                                    emitted_at: chrono::Utc::now().timestamp(),
-                                });
-                            }
-                        }
-                        sink(WorkerEvent::TaskProgress {
-                            task_id: id,
-                            ecosystem,
-                            sequence: {
-                                sequence += 1;
-                                sequence
-                            },
-                            status: crate::core::TaskStatus::Cancelled,
-                            completed: 1,
-                            total: 1,
-                            message: None,
-                            error: None,
-                            emitted_at: chrono::Utc::now().timestamp(),
+                        let persisted = database.as_ref().map_or(true, |database| {
+                            matches!(
+                                database.update_task(id, TaskStatus::Cancelled, None),
+                                Ok(true)
+                            )
                         });
+                        if !persisted {
+                            sink(WorkerEvent::TaskProgress {
+                                task_id: id,
+                                ecosystem,
+                                sequence: {
+                                    sequence += 1;
+                                    sequence
+                                },
+                                status: TaskStatus::Failed,
+                                completed: 1,
+                                total: 1,
+                                message: Some("database update failed".into()),
+                                error: Some(crate::core::TaskErrorKind::Unknown),
+                                emitted_at: chrono::Utc::now().timestamp(),
+                            });
+                        } else {
+                            sink(WorkerEvent::TaskProgress {
+                                task_id: id,
+                                ecosystem,
+                                sequence: {
+                                    sequence += 1;
+                                    sequence
+                                },
+                                status: crate::core::TaskStatus::Cancelled,
+                                completed: 1,
+                                total: 1,
+                                message: None,
+                                error: None,
+                                emitted_at: chrono::Utc::now().timestamp(),
+                            });
+                        }
                         active.lock().unwrap().remove(&id);
                         continue;
                     }
@@ -213,10 +215,14 @@ impl WorkerSupervisor {
             .ecosystem()
             .ok_or(SupervisorError::Unavailable(Ecosystem::Homebrew))?;
         let id = command.task_id().unwrap_or_else(Uuid::new_v4);
-        if self.cancellations.lock().unwrap().contains_key(&id) {
-            return Err(SupervisorError::DuplicateTask(id));
-        }
         let cancel = CancellationToken::new();
+        {
+            let mut active = self.cancellations.lock().unwrap();
+            if active.contains_key(&id) {
+                return Err(SupervisorError::DuplicateTask(id));
+            }
+            active.insert(id, cancel.clone());
+        }
         let sender = self
             .senders
             .get(&ecosystem)
@@ -234,10 +240,6 @@ impl WorkerSupervisor {
                 .create_batch(&batch)
                 .map_err(|_| SupervisorError::Unavailable(ecosystem))?;
         }
-        self.cancellations
-            .lock()
-            .unwrap()
-            .insert(id, cancel.clone());
         sender
             .send(Envelope {
                 id,
@@ -255,7 +257,6 @@ impl WorkerSupervisor {
                 }
                 SupervisorError::Unavailable(ecosystem)
             })?;
-        self.cancellations.lock().unwrap().insert(id, cancel);
         Ok(id)
     }
 
