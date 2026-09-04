@@ -189,6 +189,8 @@ pub(crate) async fn run_command(
     *sequence += 1;
     emit_state(ecosystem, "running", *sequence, &sink);
     *sequence += 1;
+    sink(WorkerEvent::LogEntry { task_id, ecosystem, sequence: *sequence, entry: crate::core::LogEntry { message: format!("开始执行任务 {task_id}"), emitted_at: Utc::now().timestamp(), stream: "worker".into() }, emitted_at: Utc::now().timestamp() });
+    *sequence += 1;
     emit_progress(
         task_id,
         ecosystem,
@@ -259,6 +261,8 @@ pub(crate) async fn run_command(
     }
     *sequence += 1;
     emit_state(ecosystem, "idle", *sequence, &sink);
+    *sequence += 1;
+    sink(WorkerEvent::BatchSummary { batch_id: task_id, ecosystem, sequence: *sequence, total: 1, succeeded: u64::from(status == TaskStatus::Succeeded), failed: u64::from(status == TaskStatus::Failed), cancelled: u64::from(status == TaskStatus::Cancelled), emitted_at: Utc::now().timestamp() });
 }
 
 pub(crate) fn command_task(

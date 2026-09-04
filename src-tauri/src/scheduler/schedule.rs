@@ -1,6 +1,10 @@
 use chrono::{Datelike, Local, NaiveDate, NaiveTime, TimeZone, Weekday};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::thread;
+use std::time::Duration;
 
 use crate::core::{Ecosystem, Operation, PackageRecord, PackageTask};
+use super::catch_up::{CatchUp, SchedulerState};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Schedule {
@@ -142,6 +146,7 @@ impl EnabledEcosystems {
 pub struct Scheduler {
     pub schedule: Schedule,
     config_version: String,
+    started: Arc<AtomicBool>,
 }
 
 impl Scheduler {
@@ -149,15 +154,34 @@ impl Scheduler {
         Self {
             schedule,
             config_version: "v1".into(),
+            started: Arc::new(AtomicBool::new(false)),
         }
     }
     pub fn with_config_version(schedule: Schedule, version: impl Into<String>) -> Self {
         Self {
             schedule,
             config_version: version.into(),
+            started: Arc::new(AtomicBool::new(false)),
         }
     }
-    pub fn start(&self) {}
+    pub fn start(&self) {
+        if self.started.swap(true, Ordering::AcqRel) { return; }
+        let schedule = self.schedule.clone();
+        let started = self.started.clone();
+        thread::spawn(move || {
+            while started.load(Ordering::Acquire) {
+                let now = chrono::Utc::now().timestamp();
+                let wait = schedule.next_due(now).saturating_sub(now).max(1) as u64;
+                thread::sleep(Duration::from_secs(wait.min(60)));
+                if wait <= 60 { break; }
+            }
+        });
+    }
+
+    pub fn catch_up(&self, state: &SchedulerState, now: i64) -> Option<String> {
+        let cycle = self.cycle_id(now);
+        CatchUp::should_run(&cycle, now, state, &self.schedule).then_some(cycle)
+    }
     pub fn next_due(&self, now: i64) -> i64 {
         self.schedule.next_due(now)
     }

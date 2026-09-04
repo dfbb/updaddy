@@ -63,6 +63,30 @@ fn parse_enum<T: serde::de::DeserializeOwned>(value: &str, field: &str) -> Resul
 }
 
 impl Database {
+    pub fn save_setting(&self, key: &str, value: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("INSERT INTO settings(key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key, value])?;
+        Ok(())
+    }
+
+    pub fn load_setting(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("SELECT value FROM settings WHERE key=?1", params![key], |r| r.get(0)).optional().map_err(Into::into)
+    }
+
+    pub fn list_tasks(&self) -> Result<Vec<PackageTask>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT task_id,ecosystem,name,operation,status,error FROM package_tasks ORDER BY rowid DESC")?;
+        let rows = stmt.query_map([], |row| {
+            let task_id = row.get::<_, String>(0)?.parse::<Uuid>().map_err(|_| rusqlite::Error::InvalidQuery)?;
+            let ecosystem = parse_enum(&row.get::<_, String>(1)?, "ecosystem").map_err(|_| rusqlite::Error::InvalidQuery)?;
+            let operation = parse_enum(&row.get::<_, String>(3)?, "operation").map_err(|_| rusqlite::Error::InvalidQuery)?;
+            let status = parse_enum(&row.get::<_, String>(4)?, "task status").map_err(|_| rusqlite::Error::InvalidQuery)?;
+            let error = row.get::<_, Option<String>>(5)?.map(|v| parse_enum(&v, "task error")).transpose().map_err(|_| rusqlite::Error::InvalidQuery)?;
+            Ok(PackageTask { task_id, ecosystem, name: row.get(2)?, operation, status, error })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+    }
     pub fn list_snapshots(&self) -> Result<Vec<PackageRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt =

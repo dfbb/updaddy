@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{State, Manager};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -57,6 +57,7 @@ pub struct StateSnapshot {
     pub packages: Vec<crate::core::PackageRecord>,
     pub logs: Vec<crate::core::LogEntry>,
     pub active_tasks: usize,
+    pub tasks: Vec<PackageTask>,
 }
 
 #[derive(Clone)]
@@ -77,11 +78,12 @@ impl AppState {
             event_sink: bus.sink(),
             executor: crate::adapters::ExecutorContext::new(),
         });
+        let settings = database.as_ref().and_then(|db| db.load_setting("settings").ok().flatten()).and_then(|raw| serde_json::from_str(&raw).ok()).unwrap_or_default();
         Self {
             supervisor: Arc::new(supervisor),
             database,
             event_bus: bus,
-            settings: Arc::new(Mutex::new(Settings::default())),
+            settings: Arc::new(Mutex::new(settings)),
             test_events: None,
         }
     }
@@ -187,11 +189,7 @@ pub fn uninstall_package(app: State<'_, AppState>, package: PackageId) -> Result
 
 #[tauri::command]
 pub fn update_all_visible(app: State<'_, AppState>) -> Result<Vec<TaskId>, String> {
-    let snapshots = app
-        .database
-        .as_ref()
-        .map(|db| db.list_snapshots().unwrap_or_default())
-        .unwrap_or_default();
+    let snapshots = app.database.as_ref().map(|db| db.list_snapshots().map_err(|e| e.to_string())).transpose()?.unwrap_or_default();
     let visible = crate::scheduler::EnabledEcosystems::only(
         &Ecosystem::ALL
             .into_iter()
@@ -217,31 +215,30 @@ pub fn get_state_snapshot(app: State<'_, AppState>) -> Result<StateSnapshot, Str
     let mut workers = HashMap::new();
     if let Some(db) = &app.database {
         for ecosystem in Ecosystem::ALL {
-            if let Ok(Some((state, _))) = db.worker_state(ecosystem) {
-                workers.insert(ecosystem, state);
-            }
+            if let Some((state, _)) = db.worker_state(ecosystem).map_err(|e| e.to_string())? { workers.insert(ecosystem, state); }
         }
     }
     let packages = app
         .database
         .as_ref()
-        .and_then(|db| db.list_snapshots().ok())
-        .unwrap_or_default();
+        .map(|db| db.list_snapshots().map_err(|e| e.to_string())).transpose()?.unwrap_or_default();
     let logs = app
         .database
         .as_ref()
-        .and_then(|db| db.list_logs().ok())
-        .unwrap_or_default();
+        .map(|db| db.list_logs().map_err(|e| e.to_string())).transpose()?.unwrap_or_default();
+    let tasks = app.database.as_ref().map(|db| db.list_tasks().map_err(|e| e.to_string())).transpose()?.unwrap_or_default();
     Ok(StateSnapshot {
         workers,
         packages,
         logs,
         active_tasks: app.supervisor.active_task_count(),
+        tasks,
     })
 }
 
 #[tauri::command]
 pub fn get_settings(app: State<'_, AppState>) -> Result<Settings, String> {
+    if let Some(db) = &app.database { if let Some(raw) = db.load_setting("settings").map_err(|e| e.to_string())? { if let Ok(s) = serde_json::from_str(&raw) { *app.settings.lock().unwrap_or_else(|p| p.into_inner()) = s; } } }
     Ok(app
         .settings
         .lock()
@@ -251,13 +248,17 @@ pub fn get_settings(app: State<'_, AppState>) -> Result<Settings, String> {
 
 #[tauri::command]
 pub fn save_settings(app: State<'_, AppState>, settings: Settings) -> Result<(), String> {
+    if !matches!(settings.theme.as_str(), "system"|"light"|"dark") { return Err("主题无效".into()); }
+    if settings.locale.trim().is_empty() || settings.visible_ecosystems.is_empty() { return Err("设置无效".into()); }
+    if let Some(schedule) = &settings.schedule { if !schedule.is_empty() && crate::scheduler::Schedule::daily(schedule).is_err() { return Err("计划时间无效".into()); } }
+    if let Some(db) = &app.database { db.save_setting("settings", &serde_json::to_string(&settings).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?; }
     *app.settings.lock().unwrap_or_else(|p| p.into_inner()) = settings;
     Ok(())
 }
 
 #[tauri::command]
-pub fn set_login_item(app: State<'_, AppState>, enabled: bool) -> Result<(), String> {
-    crate::platform::login_item::set_enabled(enabled)?;
+pub fn set_login_item(app: State<'_, AppState>, handle: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    crate::platform::login_item::set_enabled(&handle, enabled)?;
     app.settings
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -266,7 +267,8 @@ pub fn set_login_item(app: State<'_, AppState>, enabled: bool) -> Result<(), Str
 }
 
 #[tauri::command]
-pub fn open_settings() -> Result<(), String> {
+pub fn open_settings(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("main") { window.show().map_err(|e| e.to_string())?; window.set_focus().map_err(|e| e.to_string())?; }
     Ok(())
 }
 

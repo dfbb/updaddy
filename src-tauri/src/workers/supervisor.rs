@@ -219,10 +219,14 @@ impl WorkerSupervisor {
         if self.active_task_count() > 0 {
             return Err(SupervisorError::BatchInProgress);
         }
-        commands
-            .into_iter()
-            .map(|command| self.submit(command))
-            .collect()
+        let mut ids = Vec::new();
+        for command in commands {
+            match self.submit(command) {
+                Ok(id) => ids.push(id),
+                Err(err) => { for id in &ids { let _ = self.cancel(*id); } return Err(err); }
+            }
+        }
+        Ok(ids)
     }
 
     pub fn is_batch_active(&self) -> bool {
@@ -334,12 +338,8 @@ impl Drop for WorkerSupervisor {
                 cancel: CancellationToken::new(),
             });
         }
-        // JoinHandle is intentionally dropped after cancellation. Dropping detaches
-        // a misbehaving adapter instead of blocking application shutdown forever.
-        self.handles
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
+        let handles = std::mem::take(&mut *self.handles.lock().unwrap_or_else(|p| p.into_inner()));
+        for handle in handles { let _ = handle.join(); }
     }
 }
 

@@ -32,14 +32,14 @@ impl EventBus {
 
     pub fn publish(&self, event: WorkerEvent) {
         if let Some(database) = &self.database {
-            match &event {
+            let result = match &event {
                 WorkerEvent::WorkerState {
                     ecosystem,
                     state,
                     emitted_at,
                     ..
                 } => {
-                    let _ = database.set_worker_state(*ecosystem, state, *emitted_at);
+                    database.set_worker_state(*ecosystem, state, *emitted_at)
                 }
                 WorkerEvent::TaskProgress {
                     task_id,
@@ -47,13 +47,19 @@ impl EventBus {
                     error,
                     ..
                 } => {
-                    let _ = database.update_task(*task_id, *status, *error);
+                    database.update_task(*task_id, *status, *error).and_then(|ok| if ok { Ok(()) } else { Err(crate::persistence::PersistenceError::InvalidValue("task missing".into())) })
                 }
                 WorkerEvent::LogEntry { entry, .. } => {
-                    let _ = database.append_log(entry);
+                    database.append_log(entry)
                 }
-                _ => {}
-            }
+                WorkerEvent::PackageChanged { package, .. } => database.save_snapshot(package),
+                WorkerEvent::DiskUsage { ecosystem, package_id, disk_usage, .. } => {
+                    let entry = crate::persistence::DiskUsageCacheEntry { ecosystem: format!("{ecosystem:?}"), package_id: package_id.clone(), installed_version: String::new(), install_root: String::new(), path_signature: String::new(), bytes: disk_usage.bytes, status: disk_usage.status, scanned_at: chrono::Utc::now().timestamp() };
+                    database.upsert_disk_usage(&entry)
+                }
+                WorkerEvent::BatchSummary { batch_id, ecosystem, total, .. } => database.save_scheduler_state(&format!("batch:{batch_id}"), &format!("{ecosystem:?}:{total}")),
+            };
+            if let Err(err) = result { let _ = database.append_log(&LogEntry { message: format!("event persistence failed: {err}"), emitted_at: chrono::Utc::now().timestamp(), stream: "error".into() }); }
         }
         let name = match &event {
             WorkerEvent::WorkerState { .. } => "worker-state",
