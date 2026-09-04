@@ -132,25 +132,23 @@ impl EcosystemAdapter for HomebrewAdapter {
             .collect::<std::collections::HashSet<_>>();
         let mut records = Vec::new();
         for (name, current) in installed_versions(&formula_installed.stdout) {
+            let update = outdated_formula.contains(name.as_str());
             records.push(package_record(
                 Ecosystem::Homebrew,
                 ResourceKind::Formula,
                 name,
                 current,
-                outdated_formula
-                    .contains(name.as_str())
-                    .then(|| "latest".into()),
+                update.then(|| "latest".into()),
             ));
         }
         for (name, current) in installed_versions(&cask_installed.stdout) {
+            let update = outdated_cask.contains(name.as_str());
             records.push(package_record(
                 Ecosystem::Homebrew,
                 ResourceKind::Cask,
                 format!("cask:{name}"),
                 current,
-                outdated_cask
-                    .contains(name.as_str())
-                    .then(|| "latest".into()),
+                update.then(|| "latest".into()),
             ));
         }
         let changed_taps = changed_taps(&tap_refresh.stdout);
