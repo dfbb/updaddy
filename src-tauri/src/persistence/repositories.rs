@@ -63,6 +63,18 @@ fn parse_enum<T: serde::de::DeserializeOwned>(value: &str, field: &str) -> Resul
 }
 
 impl Database {
+    pub fn list_snapshots(&self) -> Result<Vec<PackageRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT payload_json FROM package_snapshots ORDER BY ecosystem, id")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.map(|row| {
+            let payload = row?;
+            serde_json::from_str(&payload).map_err(PersistenceError::from)
+        })
+        .collect()
+    }
+
     /// 保存计划状态；键和值均由 scheduler 负责定义，便于未来扩展而无需改表结构。
     pub fn save_scheduler_state(&self, key: &str, value: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
@@ -79,7 +91,9 @@ impl Database {
             "SELECT value FROM scheduler_state WHERE key = ?1",
             params![key],
             |row| row.get(0),
-        ).optional().map_err(Into::into)
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     pub fn save_snapshot(&self, snapshot: &PackageRecord) -> Result<()> {
