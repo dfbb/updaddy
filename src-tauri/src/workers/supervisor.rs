@@ -100,13 +100,10 @@ impl WorkerSupervisor {
                     let command = envelope.command;
                     let cancel = envelope.cancel;
                     if cancel.is_cancelled() {
-                        let persisted = database.as_ref().map_or(true, |database| {
-                            matches!(
-                                database.update_task(id, TaskStatus::Cancelled, None),
-                                Ok(true)
-                            )
+                        let update = database.as_ref().map_or(Ok(true), |database| {
+                            database.update_task(id, TaskStatus::Cancelled, None)
                         });
-                        if !persisted {
+                        if !matches!(&update, Ok(true)) {
                             sink(WorkerEvent::TaskProgress {
                                 task_id: id,
                                 ecosystem,
@@ -117,7 +114,14 @@ impl WorkerSupervisor {
                                 status: TaskStatus::Failed,
                                 completed: 1,
                                 total: 1,
-                                message: Some("database update failed".into()),
+                                message: Some(
+                                    match update {
+                                        Ok(false) => "database task missing",
+                                        Err(_) => "database update failed",
+                                        Ok(true) => "",
+                                    }
+                                    .into(),
+                                ),
                                 error: Some(crate::core::TaskErrorKind::Unknown),
                                 emitted_at: chrono::Utc::now().timestamp(),
                             });
@@ -137,7 +141,7 @@ impl WorkerSupervisor {
                                 emitted_at: chrono::Utc::now().timestamp(),
                             });
                         }
-                        active.lock().unwrap().remove(&id);
+                        active.lock().unwrap_or_else(|p| p.into_inner()).remove(&id);
                         continue;
                     }
                     let _guard = lock.acquire();
@@ -185,7 +189,7 @@ impl WorkerSupervisor {
                             emitted_at: chrono::Utc::now().timestamp(),
                         });
                     }
-                    active.lock().unwrap().remove(&id);
+                    active.lock().unwrap_or_else(|p| p.into_inner()).remove(&id);
                 }
             });
             senders.insert(ecosystem, tx);
@@ -217,7 +221,7 @@ impl WorkerSupervisor {
         let id = command.task_id().unwrap_or_else(Uuid::new_v4);
         let cancel = CancellationToken::new();
         {
-            let mut active = self.cancellations.lock().unwrap();
+            let mut active = self.cancellations.lock().unwrap_or_else(|p| p.into_inner());
             if active.contains_key(&id) {
                 return Err(SupervisorError::DuplicateTask(id));
             }
@@ -247,7 +251,10 @@ impl WorkerSupervisor {
                 cancel: cancel.clone(),
             })
             .map_err(|_| {
-                self.cancellations.lock().unwrap().remove(&id);
+                self.cancellations
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&id);
                 if let Some(database) = &self.database {
                     let _ = database.update_task(
                         id,
@@ -264,7 +271,7 @@ impl WorkerSupervisor {
         let token = self
             .cancellations
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .get(&task_id)
             .cloned()
             .ok_or(SupervisorError::UnknownTask(task_id))?;
@@ -273,13 +280,21 @@ impl WorkerSupervisor {
     }
 
     pub fn active_task_count(&self) -> usize {
-        self.cancellations.lock().unwrap().len()
+        self.cancellations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len()
     }
 }
 
 impl Drop for WorkerSupervisor {
     fn drop(&mut self) {
-        for token in self.cancellations.lock().unwrap().values() {
+        for token in self
+            .cancellations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+        {
             token.cancel();
         }
         for sender in self.senders.values() {
