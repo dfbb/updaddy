@@ -404,21 +404,15 @@ fn resolve_pip(roots: &[PathBuf], name: &str) -> PackageInstallPaths {
             if metadata_distribution_name(&path)
                 .is_some_and(|found| normalize_python_name(&found) == normalized_name)
             {
-                let mut paths = vec![path.clone()];
                 let record = path.join("RECORD");
-                if let Ok(contents) = fs::read_to_string(record) {
-                    paths.extend(contents.lines().filter_map(|line| {
-                        let relative = csv_first_field(line)?;
-                        if relative.as_os_str().is_empty() || relative.is_absolute() {
-                            return None;
-                        }
-                        let candidate = root.join(relative);
-                        fs::symlink_metadata(&candidate).ok().and_then(|metadata| {
-                            (metadata.file_type().is_file() || metadata.file_type().is_symlink())
-                                .then_some(candidate)
-                        })
-                    }));
-                }
+                let Ok(contents) = fs::read_to_string(record) else {
+                    return PackageInstallPaths::unavailable(root.clone());
+                };
+                let Some(record_paths) = complete_record_paths(root, &contents) else {
+                    return PackageInstallPaths::unavailable(root.clone());
+                };
+                let mut paths = vec![path.clone()];
+                paths.extend(record_paths);
                 return PackageInstallPaths {
                     install_root: root.clone(),
                     paths,
@@ -451,7 +445,24 @@ fn safe_relative(value: &str) -> Option<PathBuf> {
 fn is_python_metadata_dir(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.ends_with(".dist-info") || name.ends_with(".egg-info"))
+        .is_some_and(|name| name.ends_with(".dist-info"))
+}
+
+fn complete_record_paths(root: &Path, contents: &str) -> Option<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for line in contents.lines() {
+        let relative = csv_first_field(line)?;
+        if relative.as_os_str().is_empty() || relative.is_absolute() {
+            return None;
+        }
+        let candidate = root.join(relative);
+        let metadata = fs::symlink_metadata(&candidate).ok()?;
+        if !metadata.file_type().is_file() && !metadata.file_type().is_symlink() {
+            return None;
+        }
+        paths.push(candidate);
+    }
+    (!paths.is_empty()).then_some(paths)
 }
 
 fn metadata_distribution_name(path: &Path) -> Option<String> {
@@ -619,7 +630,28 @@ mod tests {
 
         let paths = resolve_package_paths(&package, &[directory.path().to_path_buf()]);
 
-        assert_eq!(paths.paths, vec![metadata]);
+        assert!(!paths.measurable);
+        assert!(paths.paths.is_empty());
+    }
+
+    #[test]
+    fn pip_without_a_readable_record_is_unavailable() {
+        let directory = tempfile::tempdir().unwrap();
+        let metadata = directory.path().join("demo_pkg-1.0.dist-info");
+        fs::create_dir(&metadata).unwrap();
+        fs::write(metadata.join("METADATA"), "Name: demo-pkg\n").unwrap();
+        let package = package_record(
+            Ecosystem::Pip,
+            ResourceKind::Package,
+            "demo-pkg",
+            Some("1.0".into()),
+            None,
+        );
+
+        let paths = resolve_package_paths(&package, &[directory.path().to_path_buf()]);
+
+        assert!(!paths.measurable);
+        assert!(paths.paths.is_empty());
     }
 
     #[test]
@@ -646,5 +678,92 @@ mod tests {
             .unwrap();
 
         assert_eq!(second, first);
+    }
+
+    #[test]
+    fn changed_installed_version_requires_measurement() {
+        let directory = tempfile::tempdir().unwrap();
+        let package_root = directory.path().join("demo");
+        fs::create_dir(&package_root).unwrap();
+        fs::write(package_root.join("data"), b"1234").unwrap();
+        let package = package_record(
+            Ecosystem::Npm,
+            ResourceKind::Package,
+            "demo",
+            Some("1.0.0".into()),
+            None,
+        );
+        let paths = resolve_package_paths(&package, &[directory.path().to_path_buf()]);
+        let cache = CacheStore::in_memory();
+        let service = DiskUsageService::new(cache.clone());
+        service.measure(&package, &paths).unwrap();
+        let cached = cache.get_for(&package, &paths.install_root_key()).unwrap();
+        let updated = package_record(
+            Ecosystem::Npm,
+            ResourceKind::Package,
+            "demo",
+            Some("2.0.0".into()),
+            None,
+        );
+
+        assert!(service
+            .should_measure(&updated, &paths, cached.as_ref())
+            .unwrap());
+    }
+
+    #[test]
+    fn changed_install_root_requires_measurement() {
+        let directory = tempfile::tempdir().unwrap();
+        let old_root = directory.path().join("old");
+        let new_root = directory.path().join("new");
+        fs::create_dir_all(old_root.join("demo")).unwrap();
+        fs::create_dir_all(new_root.join("demo")).unwrap();
+        let package = package_record(
+            Ecosystem::Npm,
+            ResourceKind::Package,
+            "demo",
+            Some("1.0.0".into()),
+            None,
+        );
+        let old_paths = resolve_package_paths(&package, std::slice::from_ref(&old_root));
+        let new_paths = resolve_package_paths(&package, std::slice::from_ref(&new_root));
+        let cache = CacheStore::in_memory();
+        let service = DiskUsageService::new(cache.clone());
+        service.measure(&package, &old_paths).unwrap();
+        let cached = cache
+            .get_for(&package, &old_paths.install_root_key())
+            .unwrap();
+
+        assert!(service
+            .should_measure(&package, &new_paths, cached.as_ref())
+            .unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacing_the_same_path_with_a_new_inode_requires_measurement() {
+        let directory = tempfile::tempdir().unwrap();
+        let package_root = directory.path().join("demo");
+        fs::create_dir(&package_root).unwrap();
+        fs::write(package_root.join("data"), b"1234").unwrap();
+        let package = package_record(
+            Ecosystem::Npm,
+            ResourceKind::Package,
+            "demo",
+            Some("1.0.0".into()),
+            None,
+        );
+        let paths = resolve_package_paths(&package, &[directory.path().to_path_buf()]);
+        let cache = CacheStore::in_memory();
+        let service = DiskUsageService::new(cache.clone());
+        service.measure(&package, &paths).unwrap();
+        let cached = cache.get_for(&package, &paths.install_root_key()).unwrap();
+        fs::rename(&package_root, directory.path().join("old-demo")).unwrap();
+        fs::create_dir(&package_root).unwrap();
+        fs::write(package_root.join("data"), b"5678").unwrap();
+
+        assert!(service
+            .should_measure(&package, &paths, cached.as_ref())
+            .unwrap());
     }
 }

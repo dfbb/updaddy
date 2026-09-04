@@ -244,6 +244,17 @@ pub trait EcosystemAdapter: Send + Sync + 'static {
         self.execute(context, task, cancel).await
     }
 
+    async fn update(
+        &self,
+        context: &ExecutorContext,
+        task: &PackageTask,
+        cancel: CancellationToken,
+    ) -> Result<Vec<String>, TaskErrorKind> {
+        self.run_with_context(context, WorkerCommand::Update(task.clone()), cancel)
+            .await?;
+        Ok(vec![task.name.clone()])
+    }
+
     fn install_paths(&self) -> Vec<PathBuf> {
         Vec::new()
     }

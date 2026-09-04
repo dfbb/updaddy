@@ -200,6 +200,33 @@ impl EcosystemAdapter for HomebrewAdapter {
         self.execute(context, &uninstall_task, cancel).await
     }
 
+    async fn update(
+        &self,
+        context: &ExecutorContext,
+        task: &PackageTask,
+        cancel: CancellationToken,
+    ) -> Result<Vec<String>, TaskErrorKind> {
+        let (kind, _) = Self::task_kind(&task.name);
+        if kind != ResourceKind::Tap {
+            self.execute(context, task, cancel).await?;
+            return Ok(vec![task.name.clone()]);
+        }
+        let result = self.run(context, self.plan(task)?, cancel).await?;
+        let output = format!("{}\n{}", result.stdout, result.stderr);
+        let changed = changed_taps(&output)
+            .into_iter()
+            .map(|tap| format!("tap:{tap}"))
+            .collect::<Vec<_>>();
+        if changed.is_empty()
+            && output.to_ascii_lowercase().contains("updated")
+            && output.to_ascii_lowercase().contains("tap")
+            && !output.to_ascii_lowercase().contains("already up-to-date")
+        {
+            return Err(TaskErrorKind::CommandFailed);
+        }
+        Ok(changed)
+    }
+
     fn install_paths(&self) -> Vec<PathBuf> {
         vec![
             PathBuf::from("/opt/homebrew/Cellar"),
@@ -318,26 +345,35 @@ fn outdated_versions(
         .collect()
 }
 
-fn changed_taps(output: &str) -> std::collections::HashSet<&str> {
-    let Some(start) = output.find('(') else {
-        return std::collections::HashSet::new();
-    };
-    let Some(end) = output[start + 1..].find(')') else {
-        return std::collections::HashSet::new();
-    };
-    output[start + 1..start + 1 + end]
-        .split(|character| character == ',' || character == '\n')
-        .flat_map(|part| part.split(" and "))
-        .map(str::trim)
-        .filter(|part| part.contains('/') && !part.contains(' '))
-        .collect()
+fn changed_taps(output: &str) -> std::collections::HashSet<String> {
+    let mut changed = std::collections::HashSet::new();
+    for line in output.lines().filter(|line| {
+        let line = line.to_ascii_lowercase();
+        line.contains("updated") && (line.contains(" tap ") || line.contains(" taps "))
+    }) {
+        let Some(start) = line.find('(') else {
+            continue;
+        };
+        let Some(end) = line[start + 1..].find(')') else {
+            continue;
+        };
+        changed.extend(
+            line[start + 1..start + 1 + end]
+                .split(',')
+                .flat_map(|part| part.split(" and "))
+                .map(str::trim)
+                .filter(|part| part.contains('/') && !part.contains(' '))
+                .map(str::to_owned),
+        );
+    }
+    changed
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
 
-    use super::{outdated_versions, resolve_cask_artifacts};
+    use super::{changed_taps, outdated_versions, resolve_cask_artifacts};
     use crate::disk_usage::{measure_paths, PackageInstallPaths};
 
     #[test]
@@ -351,6 +387,16 @@ mod tests {
         assert_eq!(
             cask.get("firefox"),
             Some(&(Some("123.0".into()), Some("124.0".into())))
+        );
+    }
+
+    #[test]
+    fn parses_only_taps_changed_by_this_brew_update() {
+        let changed =
+            changed_taps("Updated 1 tap (acme/one).\nNo changes for acme/two were requested.");
+        assert_eq!(
+            changed,
+            std::collections::HashSet::from(["acme/one".into()])
         );
     }
 

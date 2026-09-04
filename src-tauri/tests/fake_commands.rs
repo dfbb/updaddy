@@ -83,4 +83,19 @@ fn gem_version_and_rustup_resource_are_argv_values() {
             .collect::<Vec<_>>(),
         ["target", "remove", "wasm32-unknown-unknown"]
     );
+    let toolchain = PackageTask::new(
+        Ecosystem::Rustup,
+        "toolchain:stable-aarch64-apple-darwin",
+        Operation::Update,
+    );
+    assert_eq!(
+        RustupAdapter::new()
+            .plan(&toolchain)
+            .unwrap()
+            .args
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["update", "stable-aarch64-apple-darwin"]
+    );
 }

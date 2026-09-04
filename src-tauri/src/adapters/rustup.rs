@@ -123,7 +123,11 @@ impl EcosystemAdapter for RustupAdapter {
             (ResourceKind::Toolchain, task.name.as_str())
         };
         if matches!(task.operation, Operation::Update) {
-            return Ok(command("rustup", ["update"]));
+            if kind != ResourceKind::Toolchain {
+                return Err(TaskErrorKind::InvalidInput);
+            }
+            validate_resource_name(Ecosystem::Rustup, kind, name)?;
+            return Ok(command("rustup", ["update", name]));
         }
         if !matches!(task.operation, Operation::Uninstall) {
             return Err(TaskErrorKind::InvalidInput);

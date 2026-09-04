@@ -4,11 +4,14 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
-use updaddy_lib::adapters::{package_record, EcosystemAdapter, ExecutorContext};
+use updaddy_lib::adapters::{
+    package_record, CommandRunner, EcosystemAdapter, ExecutorContext, HomebrewAdapter,
+};
 use updaddy_lib::core::{
     Ecosystem, Operation, PackageRecord, PackageTask, ResourceKind, TaskErrorKind, TaskStatus,
 };
 use updaddy_lib::disk_usage::{resolve_package_paths, CacheStore, DiskUsageService};
+use updaddy_lib::executor::{CommandResult, CommandSpec, ProcessError};
 use updaddy_lib::persistence::Database;
 use updaddy_lib::workers::{
     SupervisorContext, WorkerCommand, WorkerEvent, WorkerEventSink, WorkerSupervisor,
@@ -40,7 +43,14 @@ fn cache_entry(
     bytes: u64,
 ) -> updaddy_lib::persistence::DiskUsageCacheEntry {
     updaddy_lib::persistence::DiskUsageCacheEntry {
-        ecosystem: "npm".into(),
+        ecosystem: match package.ecosystem {
+            Ecosystem::Homebrew => "homebrew",
+            Ecosystem::Npm => "npm",
+            Ecosystem::Pip => "pip",
+            Ecosystem::Gem => "gem",
+            Ecosystem::Rustup => "rustup",
+        }
+        .into(),
         package_id: package.id.clone(),
         installed_version: package.current_version.clone().unwrap_or_default(),
         install_root: install_root.to_string_lossy().into_owned(),
@@ -49,6 +59,16 @@ fn cache_entry(
         status: updaddy_lib::core::DiskUsageStatus::Ready,
         scanned_at: 10,
     }
+}
+
+fn tap_package(name: &str) -> PackageRecord {
+    package_record(
+        Ecosystem::Homebrew,
+        ResourceKind::Tap,
+        format!("tap:{name}"),
+        None,
+        Some("updated".into()),
+    )
 }
 
 #[test]
@@ -106,7 +126,7 @@ impl EcosystemAdapter for ScanAdapter {
     }
 
     async fn scan(&self, _context: &ExecutorContext) -> Result<Vec<PackageRecord>, TaskErrorKind> {
-        Ok(vec![package("a")])
+        Ok(vec![package("a"), package("b")])
     }
 
     async fn resolve_install_paths(
@@ -193,7 +213,9 @@ fn scan_persists_snapshot_and_emits_disk_usage() {
     let directory = tempfile::tempdir().unwrap();
     let install_root = directory.path().join("node_modules");
     fs::create_dir_all(install_root.join("a")).unwrap();
+    fs::create_dir_all(install_root.join("b")).unwrap();
     fs::write(install_root.join("a/data"), vec![0; 128]).unwrap();
+    fs::write(install_root.join("b/data"), vec![0; 64]).unwrap();
     let database = Arc::new(Database::open(directory.path().join("updaddy.sqlite")).unwrap());
     let (supervisor, events) = start_supervisor(database.clone(), install_root);
 
@@ -201,12 +223,88 @@ fn scan_persists_snapshot_and_emits_disk_usage() {
         .submit(WorkerCommand::Scan(Ecosystem::Npm))
         .unwrap();
     let events = wait_for_success(&events, task_id);
-    assert!(events.iter().any(|event| {
-        matches!(event, WorkerEvent::DiskUsage { task_id: id, disk_usage, .. } if *id == task_id && disk_usage.bytes == 128)
-    }));
+    let disk_task_ids = events
+        .iter()
+        .filter_map(|event| match event {
+            WorkerEvent::DiskUsage {
+                task_id: id,
+                disk_usage,
+                ..
+            } if disk_usage.bytes == 128 || disk_usage.bytes == 64 => Some(*id),
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(disk_task_ids.len(), 2);
+    assert!(!disk_task_ids.contains(&task_id));
+
+    let batch_id = database.batch_id_for_task(task_id).unwrap().unwrap();
+    let batch = database.load_batch(batch_id).unwrap().unwrap();
+    let measure_tasks = batch
+        .tasks
+        .iter()
+        .filter(|task| task.operation == Operation::MeasureDisk)
+        .collect::<Vec<_>>();
+    assert_eq!(measure_tasks.len(), 2);
+    assert!(measure_tasks
+        .iter()
+        .all(|task| task.status == TaskStatus::Succeeded));
+    assert_eq!(
+        measure_tasks
+            .iter()
+            .map(|task| task.task_id)
+            .collect::<std::collections::HashSet<_>>(),
+        disk_task_ids
+    );
 
     let snapshot = database.load_snapshot(&package("a").id).unwrap().unwrap();
     assert_eq!(snapshot.disk_usage.unwrap().bytes, 128);
+}
+
+#[test]
+fn cache_hit_still_uses_a_succeeded_measurement_task_per_package() {
+    let directory = tempfile::tempdir().unwrap();
+    let install_root = directory.path().join("node_modules");
+    fs::create_dir_all(install_root.join("a")).unwrap();
+    fs::create_dir_all(install_root.join("b")).unwrap();
+    fs::write(install_root.join("a/data"), vec![0; 128]).unwrap();
+    fs::write(install_root.join("b/data"), vec![0; 64]).unwrap();
+    let database = Arc::new(Database::open(directory.path().join("updaddy.sqlite")).unwrap());
+    let (supervisor, events) = start_supervisor(database.clone(), install_root);
+
+    let first_scan = supervisor
+        .submit(WorkerCommand::Scan(Ecosystem::Npm))
+        .unwrap();
+    wait_for_success(&events, first_scan);
+    let second_scan = supervisor
+        .submit(WorkerCommand::Scan(Ecosystem::Npm))
+        .unwrap();
+    let emitted = wait_for_success(&events, second_scan);
+    let batch_id = database.batch_id_for_task(second_scan).unwrap().unwrap();
+    let batch = database.load_batch(batch_id).unwrap().unwrap();
+    let measure_tasks = batch
+        .tasks
+        .iter()
+        .filter(|task| task.operation == Operation::MeasureDisk)
+        .collect::<Vec<_>>();
+    let measure_task_ids = measure_tasks
+        .iter()
+        .map(|task| task.task_id)
+        .collect::<std::collections::HashSet<_>>();
+    let emitted_task_ids = emitted
+        .iter()
+        .filter_map(|event| match event {
+            WorkerEvent::DiskUsage { task_id, .. } if measure_task_ids.contains(task_id) => {
+                Some(*task_id)
+            }
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+
+    assert_eq!(measure_tasks.len(), 2);
+    assert!(measure_tasks
+        .iter()
+        .all(|task| task.status == TaskStatus::Succeeded));
+    assert_eq!(emitted_task_ids, measure_task_ids);
 }
 
 #[test]
@@ -302,4 +400,83 @@ fn successful_uninstall_removes_only_the_requested_package() {
     assert!(cache.get(&a).unwrap().is_none());
     assert_eq!(database.load_snapshot(&b.id).unwrap(), Some(b.clone()));
     assert_eq!(cache.get(&b).unwrap().unwrap().bytes, 200);
+}
+
+struct BrewUpdateRunner;
+
+#[async_trait]
+impl CommandRunner for BrewUpdateRunner {
+    async fn run(
+        &self,
+        spec: CommandSpec,
+        _cancel: CancellationToken,
+    ) -> Result<CommandResult, ProcessError> {
+        assert_eq!(spec.program, "brew");
+        assert_eq!(
+            spec.args.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["update"]
+        );
+        Ok(CommandResult {
+            status: std::process::Command::new("sh")
+                .args(["-c", "exit 0"])
+                .status()
+                .unwrap(),
+            stdout: "Updated 1 tap (acme/one).\n".into(),
+            stderr: String::new(),
+            duration: Duration::ZERO,
+        })
+    }
+}
+
+#[test]
+fn homebrew_update_invalidates_only_taps_changed_by_the_command() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = Arc::new(Database::open(directory.path().join("updaddy.sqlite")).unwrap());
+    let changed = tap_package("acme/one");
+    let unchanged = tap_package("acme/two");
+    database.save_snapshot(&changed).unwrap();
+    database.save_snapshot(&unchanged).unwrap();
+    let tap_root = std::path::Path::new("/opt/homebrew/Library/Taps");
+    let cache = CacheStore::from_database(database.clone());
+    cache.put(cache_entry(&changed, tap_root, 100)).unwrap();
+    cache.put(cache_entry(&unchanged, tap_root, 200)).unwrap();
+    let events = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+    let sink: WorkerEventSink = {
+        let events = events.clone();
+        Arc::new(move |event| {
+            events.0.lock().unwrap().push(event);
+            events.1.notify_all();
+        })
+    };
+    let mut context = SupervisorContext::new(sink);
+    context.database = Some(database.clone());
+    context
+        .adapters
+        .insert(Ecosystem::Homebrew, Arc::new(HomebrewAdapter::new()));
+    context.executor = ExecutorContext::with_runner(Arc::new(BrewUpdateRunner));
+    let supervisor = WorkerSupervisor::start(context);
+
+    let task_id = supervisor
+        .submit(WorkerCommand::Update(PackageTask::new(
+            Ecosystem::Homebrew,
+            changed.name.clone(),
+            Operation::Update,
+        )))
+        .unwrap();
+    let emitted = wait_for_success(&events, task_id);
+
+    let changed_cache = cache.get(&changed).unwrap().unwrap();
+    assert_eq!(changed_cache.bytes, 0);
+    assert_eq!(
+        changed_cache.status,
+        updaddy_lib::core::DiskUsageStatus::Unavailable
+    );
+    assert_eq!(cache.get(&unchanged).unwrap().unwrap().bytes, 200);
+    assert!(emitted.iter().any(|event| {
+        matches!(event, WorkerEvent::DiskUsage { task_id: disk_task_id, package_id, .. }
+            if *disk_task_id != task_id && package_id == &changed.id)
+    }));
+    assert!(!emitted.iter().any(|event| {
+        matches!(event, WorkerEvent::DiskUsage { package_id, .. } if package_id == &unchanged.id)
+    }));
 }

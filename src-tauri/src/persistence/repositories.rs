@@ -1,4 +1,4 @@
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde_json;
 use uuid::Uuid;
 
@@ -207,6 +207,51 @@ impl Database {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn append_tasks_to_task_batch(
+        &self,
+        parent_task_id: Uuid,
+        tasks: &[PackageTask],
+    ) -> Result<Option<Uuid>> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let batch_id = tx
+            .query_row(
+                "SELECT batch_id FROM package_tasks WHERE task_id = ?1",
+                params![parent_task_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(batch_id) = batch_id else {
+            return Ok(None);
+        };
+        let batch_id = batch_id.parse::<Uuid>().map_err(|_| {
+            PersistenceError::InvalidValue("package task has an invalid batch id".into())
+        })?;
+        for task in tasks {
+            insert_task(&tx, batch_id, task)?;
+        }
+        tx.commit()?;
+        Ok(Some(batch_id))
+    }
+
+    pub fn batch_id_for_task(&self, task_id: Uuid) -> Result<Option<Uuid>> {
+        let conn = self.conn.lock().unwrap();
+        let batch_id = conn
+            .query_row(
+                "SELECT batch_id FROM package_tasks WHERE task_id = ?1",
+                params![task_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        batch_id
+            .map(|value| {
+                value.parse::<Uuid>().map_err(|_| {
+                    PersistenceError::InvalidValue("package task has an invalid batch id".into())
+                })
+            })
+            .transpose()
     }
 
     pub fn append_log(&self, entry: &LogEntry) -> Result<()> {
