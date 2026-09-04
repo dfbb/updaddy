@@ -238,12 +238,19 @@ fn outdated_versions(
             let body = rest[..close].trim();
             let after = rest[close + 1..].trim();
             let (current, target) = if let Some((current, target)) = body.split_once('<') {
-                (current.trim(), target.trim())
+                (
+                    current.trim(),
+                    target.split(" [").next().unwrap_or(target).trim(),
+                )
             } else {
                 let target = after
                     .strip_prefix("<")
                     .or_else(|| after.strip_prefix("!="))
-                    .map(str::trim)?;
+                    .map(str::trim)?
+                    .split(" [")
+                    .next()
+                    .unwrap_or_default()
+                    .trim();
                 (body.split(',').next().unwrap_or(body).trim(), target)
             };
             if target.is_empty() {

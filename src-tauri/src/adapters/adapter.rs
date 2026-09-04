@@ -383,9 +383,14 @@ pub fn validate_resource_name(
         | (Ecosystem::Gem, ResourceKind::Package)
         | (Ecosystem::Rustup, ResourceKind::Toolchain)
         | (Ecosystem::Rustup, ResourceKind::Component)
-        | (Ecosystem::Rustup, ResourceKind::Target)
-        | (Ecosystem::Homebrew, ResourceKind::Formula)
-        | (Ecosystem::Homebrew, ResourceKind::Cask) => validate_segment(name, false),
+        | (Ecosystem::Rustup, ResourceKind::Target) => validate_segment(name, false),
+        (Ecosystem::Homebrew, ResourceKind::Formula)
+        | (Ecosystem::Homebrew, ResourceKind::Cask) => {
+            if name.matches('@').count() > 1 {
+                return Err(TaskErrorKind::InvalidInput);
+            }
+            validate_segment(name, true)
+        }
         _ => validate_name(name),
     }
 }
@@ -421,6 +426,9 @@ pub fn classify_command_error(result: &CommandResult) -> TaskErrorKind {
             || text.contains("operation")
             || text.contains("read")))
         || text.contains("connect timeout")
+        || text.contains("etimedout")
+        || text.contains("open_timeout")
+        || text.contains("open timeout")
         || text.contains("readtimeout")
         || text.contains("read timeout")
         || text.contains("could not resolve host")
@@ -442,6 +450,8 @@ pub fn classify_command_error(result: &CommandResult) -> TaskErrorKind {
             || text.contains("connection reset")
             || text.contains("connection aborted")
             || text.contains("econnrefused")
+            || text.contains("econnreset")
+            || text.contains("econnaborted")
             || text.contains("handshake failed")
             || text.contains("broken pipe")
             || text.contains("closed"))
@@ -460,6 +470,7 @@ pub fn classify_command_error(result: &CommandResult) -> TaskErrorKind {
     }) || http_codes.iter().any(|code| {
         text.contains(&format!("{code} service unavailable"))
             || text.contains(&format!("{code} bad gateway"))
+            || text.contains(&format!("returned error: {code}"))
     });
     if http_5xx {
         return TaskErrorKind::HttpServerTemporaryError;

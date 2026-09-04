@@ -19,7 +19,8 @@ pub struct NoopAdapter;
 
 impl EcosystemAdapter for NoopAdapter {}
 
-const MAX_ATTEMPTS: u32 = 3;
+const RETRY_DELAYS_SECONDS: [u64; 3] = [5, 30, 120];
+const MAX_ATTEMPTS: u32 = 1 + RETRY_DELAYS_SECONDS.len() as u32;
 
 async fn run_with_retries(
     adapter: &dyn EcosystemAdapter,
@@ -52,7 +53,7 @@ async fn run_with_retries(
         }
         match result {
             Err(error) if error.is_retryable() && attempt < MAX_ATTEMPTS => {
-                let delay = Duration::from_secs(1_u64 << (attempt - 1));
+                let delay = Duration::from_secs(RETRY_DELAYS_SECONDS[(attempt - 1) as usize]);
                 attempt += 1;
                 tokio::select! {
                     _ = cancel.cancelled() => return Err(TaskErrorKind::CommandFailed),

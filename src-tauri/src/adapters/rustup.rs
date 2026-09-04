@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
@@ -70,17 +71,20 @@ impl EcosystemAdapter for RustupAdapter {
             )
             .await?;
         let targets = self
-            .list(context, &["target", "list", "--installed"], cancel)
+            .list(context, &["target", "list", "--installed"], cancel.clone())
             .await?;
+        let check = self.list(context, &["check"], cancel).await?;
+        let updates = toolchain_updates(&check);
         let mut records = Vec::new();
         for line in lines(&toolchains) {
             let name = line.split_whitespace().next().unwrap_or(line);
+            let update = updates.get(name);
             records.push(package_record(
                 Ecosystem::Rustup,
                 ResourceKind::Toolchain,
                 format!("toolchain:{name}"),
-                None,
-                None,
+                update.and_then(|(current, _)| current.clone()),
+                update.and_then(|(_, target)| target.clone()),
             ));
         }
         for line in lines(&components) {
@@ -139,6 +143,27 @@ impl EcosystemAdapter for RustupAdapter {
     fn classify_error(&self, result: &CommandResult) -> TaskErrorKind {
         super::adapter::classify_command_error(result)
     }
+}
+
+fn toolchain_updates(output: &str) -> HashMap<&str, (Option<String>, Option<String>)> {
+    lines(output)
+        .filter_map(|line| {
+            let name = line.split_whitespace().next()?;
+            let (current, target) = line.split_once("->")?;
+            let current = current
+                .split(':')
+                .next_back()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
+            let target = target
+                .split_whitespace()
+                .next()
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
+            Some((name, (current, target)))
+        })
+        .collect()
 }
 
 impl RustupAdapter {
