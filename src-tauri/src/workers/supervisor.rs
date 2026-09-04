@@ -78,7 +78,7 @@ impl WorkerSupervisor {
             let executor = context.executor.clone();
             let active = cancellations.clone();
             let lock = shared_resource_lock(resource_lock_key(ecosystem));
-            context.event_sink(WorkerEvent::WorkerState {
+            (context.event_sink)(WorkerEvent::WorkerState {
                 ecosystem,
                 sequence: 0,
                 state: "idle".into(),
