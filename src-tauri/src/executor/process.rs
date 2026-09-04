@@ -296,4 +296,29 @@ mod tests {
         assert!(matches!(result, Err(ProcessError::Cancelled)));
         assert!(started.elapsed() < Duration::from_secs(4));
     }
+
+    #[tokio::test]
+    async fn output_events_are_emitted_per_line() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collected = events.clone();
+        let event_sink: EventSink = Arc::new(move |event| {
+            collected.lock().unwrap().push(event);
+        });
+        ProcessSupervisor::run(
+            CommandSpec::for_test("printf", &["one\\ntwo\\n"]),
+            CancellationToken::new(),
+            event_sink,
+        )
+        .await
+        .unwrap();
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["one", "two"]
+        );
+        assert!(events.iter().all(|event| event.stream == "stdout"));
+    }
 }
