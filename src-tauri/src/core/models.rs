@@ -78,6 +78,16 @@ pub struct LogEntry {
     pub stream: String,
 }
 
+impl LogEntry {
+    pub fn at(message: impl Into<String>, unix_seconds: i64) -> Self {
+        Self {
+            message: message.into(),
+            emitted_at: unix_seconds,
+            stream: "system".into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackageTask {
     pub task_id: Uuid,

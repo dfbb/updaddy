@@ -1,0 +1,161 @@
+use rusqlite::params;
+use serde_json;
+use uuid::Uuid;
+
+use crate::core::{
+    DiskUsageStatus, Ecosystem, LogEntry, OperationBatch, PackageRecord, PackageTask,
+};
+
+use super::db::{Database, Result};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskUsageCacheEntry {
+    pub ecosystem: String,
+    pub package_id: String,
+    pub installed_version: String,
+    pub install_root: String,
+    pub path_signature: String,
+    pub bytes: u64,
+    pub status: DiskUsageStatus,
+    pub scanned_at: i64,
+}
+
+impl DiskUsageCacheEntry {
+    pub fn ready(
+        ecosystem: impl Into<String>,
+        package_id: impl Into<String>,
+        version: impl Into<String>,
+        root: impl Into<String>,
+        bytes: u64,
+    ) -> Self {
+        Self {
+            ecosystem: ecosystem.into(),
+            package_id: package_id.into(),
+            installed_version: version.into(),
+            install_root: root.into(),
+            path_signature: String::new(),
+            bytes,
+            status: DiskUsageStatus::Ready,
+            scanned_at: chrono::Utc::now().timestamp(),
+        }
+    }
+}
+
+fn enum_name<T: serde::Serialize>(v: &T) -> Result<String> {
+    Ok(serde_json::to_value(v)?
+        .as_str()
+        .unwrap_or_default()
+        .to_owned())
+}
+
+impl Database {
+    pub fn save_snapshot(&self, snapshot: &PackageRecord) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("INSERT INTO package_snapshots(id,ecosystem,payload_json,updated_at) VALUES (?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET ecosystem=excluded.ecosystem,payload_json=excluded.payload_json,updated_at=excluded.updated_at", params![snapshot.id, enum_name(&snapshot.ecosystem)?, serde_json::to_string(snapshot)?, chrono::Utc::now().timestamp()])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn upsert_disk_usage(&self, entry: &DiskUsageCacheEntry) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("INSERT INTO disk_usage_cache(ecosystem,package_id,installed_version,install_root,path_signature,bytes,status,scanned_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(ecosystem,package_id,installed_version,install_root) DO UPDATE SET path_signature=excluded.path_signature,bytes=excluded.bytes,status=excluded.status,scanned_at=excluded.scanned_at", params![entry.ecosystem, entry.package_id, entry.installed_version, entry.install_root, entry.path_signature, entry.bytes as i64, enum_name(&entry.status)?, entry.scanned_at])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn find_disk_usage(
+        &self,
+        ecosystem: &str,
+        package_id: &str,
+        version: &str,
+        root: &str,
+    ) -> Result<Option<DiskUsageCacheEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT ecosystem,package_id,installed_version,install_root,path_signature,bytes,status,scanned_at FROM disk_usage_cache WHERE ecosystem=?1 AND package_id=?2 AND installed_version=?3 AND install_root=?4")?;
+        let mut rows = stmt.query(params![ecosystem, package_id, version, root])?;
+        let value = rows
+            .next()?
+            .map(|r| {
+                Ok(DiskUsageCacheEntry {
+                    ecosystem: r.get(0)?,
+                    package_id: r.get(1)?,
+                    installed_version: r.get(2)?,
+                    install_root: r.get(3)?,
+                    path_signature: r.get(4)?,
+                    bytes: r.get::<_, i64>(5)? as u64,
+                    status: parse_status(&r.get::<_, String>(6)?),
+                    scanned_at: r.get(7)?,
+                })
+            })
+            .transpose()?;
+        Ok(value)
+    }
+
+    pub fn create_batch(&self, batch: &OperationBatch) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO operation_batches(batch_id,ecosystem,created_at) VALUES (?1,?2,?3)",
+            params![
+                batch.batch_id.to_string(),
+                enum_name(&batch.ecosystem)?,
+                batch.created_at
+            ],
+        )?;
+        for task in &batch.tasks {
+            insert_task(&tx, batch.batch_id, task)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn append_log(&self, entry: &LogEntry) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO log_entries(message,emitted_at,stream) VALUES (?1,?2,?3)",
+            params![entry.message, entry.emitted_at, entry.stream],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn mark_running_tasks_interrupted(&self) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let changed = tx.execute(
+            "UPDATE package_tasks SET status='interrupted' WHERE status='running'",
+            [],
+        )? as u64;
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    pub fn set_worker_state(
+        &self,
+        ecosystem: Ecosystem,
+        state: &str,
+        updated_at: i64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("INSERT INTO worker_state(ecosystem,state,updated_at) VALUES (?1,?2,?3) ON CONFLICT(ecosystem) DO UPDATE SET state=excluded.state,updated_at=excluded.updated_at", params![enum_name(&ecosystem)?, state, updated_at])?;
+        tx.commit()?;
+        Ok(())
+    }
+}
+
+fn insert_task(tx: &rusqlite::Transaction<'_>, batch_id: Uuid, task: &PackageTask) -> Result<()> {
+    tx.execute("INSERT INTO package_tasks(task_id,batch_id,ecosystem,name,operation,status,error) VALUES (?1,?2,?3,?4,?5,?6,?7)", params![task.task_id.to_string(), batch_id.to_string(), enum_name(&task.ecosystem)?, task.name, enum_name(&task.operation)?, enum_name(&task.status)?, task.error.as_ref().map(enum_name).transpose()?])?;
+    Ok(())
+}
+
+fn parse_status(s: &str) -> DiskUsageStatus {
+    match s {
+        "measuring" => DiskUsageStatus::Measuring,
+        "unavailable" => DiskUsageStatus::Unavailable,
+        _ => DiskUsageStatus::Ready,
+    }
+}
