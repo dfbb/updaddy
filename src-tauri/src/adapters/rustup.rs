@@ -7,7 +7,8 @@ use crate::core::{Ecosystem, Operation, PackageRecord, PackageTask, ResourceKind
 use crate::executor::{CommandResult, CommandSpec};
 
 use super::adapter::{
-    command, home_path, package_record, validate_name, EcosystemAdapter, ExecutorContext,
+    classify_process_error, command, home_path, package_record, validate_resource_name,
+    EcosystemAdapter, ExecutorContext,
 };
 use super::parsers::lines;
 
@@ -123,7 +124,7 @@ impl EcosystemAdapter for RustupAdapter {
         if !matches!(task.operation, Operation::Uninstall) {
             return Err(TaskErrorKind::InvalidInput);
         }
-        validate_name(name)?;
+        validate_resource_name(Ecosystem::Rustup, kind, name)?;
         let args = match kind {
             ResourceKind::Toolchain => vec!["toolchain", "uninstall", name],
             ResourceKind::Component => vec!["component", "remove", name],
@@ -150,7 +151,7 @@ impl RustupAdapter {
         let result = context
             .run(command("rustup", args), cancel)
             .await
-            .map_err(|_| TaskErrorKind::CommandFailed)?;
+            .map_err(|error| classify_process_error(&error))?;
         if result.status.success() {
             Ok(result.stdout)
         } else {

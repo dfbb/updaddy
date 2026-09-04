@@ -7,7 +7,8 @@ use crate::core::{Ecosystem, PackageRecord, PackageTask, ResourceKind, TaskError
 use crate::executor::{CommandResult, CommandSpec};
 
 use super::adapter::{
-    command, home_path, package_record, validate_name, EcosystemAdapter, ExecutorContext,
+    classify_process_error, command, home_path, package_record, validate_resource_name,
+    EcosystemAdapter, ExecutorContext,
 };
 use super::parsers::lines;
 
@@ -28,7 +29,7 @@ impl HomebrewAdapter {
         let result = context
             .run(spec, cancel)
             .await
-            .map_err(|_| TaskErrorKind::CommandFailed)?;
+            .map_err(|error| classify_process_error(&error))?;
         if result.status.success() {
             Ok(result)
         } else {
@@ -90,6 +91,24 @@ impl EcosystemAdapter for HomebrewAdapter {
         context: &ExecutorContext,
         cancel: CancellationToken,
     ) -> Result<Vec<PackageRecord>, TaskErrorKind> {
+        // Refresh metadata before reading either installed or outdated resources.
+        let tap_refresh = self
+            .run(context, command("brew", ["update"]), cancel.clone())
+            .await?;
+        let formula_installed = self
+            .run(
+                context,
+                command("brew", ["list", "--formula", "--versions"]),
+                cancel.clone(),
+            )
+            .await?;
+        let cask_installed = self
+            .run(
+                context,
+                command("brew", ["list", "--cask", "--versions"]),
+                cancel.clone(),
+            )
+            .await?;
         let formula = self
             .run(
                 context,
@@ -104,37 +123,44 @@ impl EcosystemAdapter for HomebrewAdapter {
                 cancel.clone(),
             )
             .await?;
-        // Homebrew refreshes tap metadata through `brew update`; keep its output out of package rows.
-        let _tap_refresh = self
-            .run(context, command("brew", ["update"]), cancel.clone())
-            .await?;
         let taps = self.run(context, command("brew", ["tap"]), cancel).await?;
+        let outdated_formula = lines(&formula.stdout)
+            .map(|line| line.split_whitespace().next().unwrap_or(line))
+            .collect::<std::collections::HashSet<_>>();
+        let outdated_cask = lines(&cask.stdout)
+            .map(|line| line.split_whitespace().next().unwrap_or(line))
+            .collect::<std::collections::HashSet<_>>();
         let mut records = Vec::new();
-        for name in lines(&formula.stdout) {
+        for (name, current) in installed_versions(&formula_installed.stdout) {
             records.push(package_record(
                 Ecosystem::Homebrew,
                 ResourceKind::Formula,
                 name,
-                None,
-                Some("latest".into()),
+                current,
+                outdated_formula
+                    .contains(name.as_str())
+                    .then(|| "latest".into()),
             ));
         }
-        for name in lines(&cask.stdout) {
+        for (name, current) in installed_versions(&cask_installed.stdout) {
             records.push(package_record(
                 Ecosystem::Homebrew,
                 ResourceKind::Cask,
                 format!("cask:{name}"),
-                None,
-                Some("latest".into()),
+                current,
+                outdated_cask
+                    .contains(name.as_str())
+                    .then(|| "latest".into()),
             ));
         }
+        let changed_taps = changed_taps(&tap_refresh.stdout);
         for name in lines(&taps.stdout) {
             records.push(package_record(
                 Ecosystem::Homebrew,
                 ResourceKind::Tap,
                 format!("tap:{name}"),
                 None,
-                None,
+                changed_taps.contains(name).then(|| "updated".into()),
             ));
         }
         Ok(records)
@@ -145,7 +171,7 @@ impl EcosystemAdapter for HomebrewAdapter {
             return Err(TaskErrorKind::InvalidInput);
         }
         let (kind, name) = Self::task_kind(&task.name);
-        validate_name(name)?;
+        validate_resource_name(Ecosystem::Homebrew, kind, name)?;
         let args: Vec<String> = match (task.operation, kind) {
             (crate::core::Operation::Update, ResourceKind::Formula) => {
                 vec!["upgrade".into(), name.into()]
@@ -194,4 +220,28 @@ impl EcosystemAdapter for HomebrewAdapter {
     fn classify_error(&self, result: &CommandResult) -> TaskErrorKind {
         super::adapter::classify_command_error(result)
     }
+}
+
+fn installed_versions(output: &str) -> impl Iterator<Item = (String, Option<String>)> + '_ {
+    lines(output).map(|line| {
+        let mut fields = line.split_whitespace();
+        let name = fields.next().unwrap_or_default().to_owned();
+        let version = fields.next().map(str::to_owned);
+        (name, version)
+    })
+}
+
+fn changed_taps(output: &str) -> std::collections::HashSet<&str> {
+    let Some(start) = output.find('(') else {
+        return std::collections::HashSet::new();
+    };
+    let Some(end) = output[start + 1..].find(')') else {
+        return std::collections::HashSet::new();
+    };
+    output[start + 1..start + 1 + end]
+        .split(|character| character == ',' || character == '\n')
+        .flat_map(|part| part.split(" and "))
+        .map(str::trim)
+        .filter(|part| part.contains('/') && !part.contains(' '))
+        .collect()
 }

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -10,9 +11,23 @@ use crate::executor::{sink, CommandResult, CommandSpec, ProcessError, ProcessSup
 use crate::workers::WorkerCommand;
 
 /// Environment variables injected by the proxy runtime. Values are never put in argv.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct ProxyEnv {
     pub vars: HashMap<String, String>,
+}
+
+impl fmt::Debug for ProxyEnv {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let redacted = self
+            .vars
+            .keys()
+            .map(|key| (key.as_str(), "<redacted>"))
+            .collect::<HashMap<_, _>>();
+        formatter
+            .debug_struct("ProxyEnv")
+            .field("vars", &redacted)
+            .finish()
+    }
 }
 
 impl ProxyEnv {
@@ -100,6 +115,30 @@ impl ExecutorContext {
         mut spec: CommandSpec,
         cancel: CancellationToken,
     ) -> Result<CommandResult, ProcessError> {
+        // ProcessSupervisor clears inherited variables. Restore only the allowlisted values
+        // package managers need to resolve the active user's global installation.
+        let path = std::env::var("PATH").unwrap_or_else(|_| {
+            "/opt/homebrew/bin:/usr/local/bin:$HOME/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+                .replace("$HOME", &home_dir().to_string_lossy())
+        });
+        spec.env.entry("PATH".to_owned()).or_insert(path);
+        spec.env
+            .entry("HOME".to_owned())
+            .or_insert_with(|| home_dir().to_string_lossy().into_owned());
+        for key in [
+            "NPM_CONFIG_PREFIX",
+            "GEM_HOME",
+            "GEM_PATH",
+            "VIRTUAL_ENV",
+            "RUSTUP_HOME",
+            "CARGO_HOME",
+        ] {
+            if let Some(value) = std::env::var_os(key) {
+                spec.env
+                    .entry(key.to_owned())
+                    .or_insert_with(|| value.to_string_lossy().into_owned());
+            }
+        }
         for (key, value) in &self.proxy.vars {
             spec.env.insert(key.clone(), value.clone());
         }
@@ -152,19 +191,7 @@ pub trait EcosystemAdapter: Send + Sync + 'static {
         let result = context
             .run(spec, cancel)
             .await
-            .map_err(|error| match error {
-                ProcessError::Cancelled => TaskErrorKind::CommandFailed,
-                ProcessError::Spawn(source)
-                    if source.kind() == std::io::ErrorKind::PermissionDenied =>
-                {
-                    TaskErrorKind::PermissionDenied
-                }
-                ProcessError::Spawn(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                    TaskErrorKind::CommandFailed
-                }
-                ProcessError::ProcessTimeout => TaskErrorKind::CommandFailed,
-                _ => TaskErrorKind::CommandFailed,
-            })?;
+            .map_err(|error| classify_process_error(&error))?;
         if result.status.success() {
             Ok(())
         } else {
@@ -185,6 +212,16 @@ pub trait EcosystemAdapter: Send + Sync + 'static {
         Vec::new()
     }
 
+    /// Resolve paths for the active global environment. Implementations may run their
+    /// manager's introspection command; static paths remain a conservative fallback.
+    async fn resolve_install_paths(
+        &self,
+        _context: &ExecutorContext,
+        _cancel: CancellationToken,
+    ) -> Result<Vec<PathBuf>, TaskErrorKind> {
+        Ok(self.install_paths())
+    }
+
     fn classify_error(&self, result: &CommandResult) -> TaskErrorKind {
         classify_command_error(result)
     }
@@ -192,10 +229,11 @@ pub trait EcosystemAdapter: Send + Sync + 'static {
     /// Compatibility bridge for the Task 5 worker queue.
     async fn run(
         &self,
-        _command: WorkerCommand,
-        _cancel: CancellationToken,
+        command: WorkerCommand,
+        cancel: CancellationToken,
     ) -> Result<(), TaskErrorKind> {
-        Err(TaskErrorKind::Unknown)
+        let context = ExecutorContext::new();
+        self.execute_worker_command(&context, command, cancel).await
     }
 
     async fn run_with_context(
@@ -264,6 +302,56 @@ pub fn validate_name(name: &str) -> Result<(), TaskErrorKind> {
     Ok(())
 }
 
+fn validate_segment(name: &str, allow_at: bool) -> Result<(), TaskErrorKind> {
+    validate_name(name)?;
+    if name.starts_with('@') && !allow_at {
+        return Err(TaskErrorKind::InvalidInput);
+    }
+    if !name.chars().all(|character| {
+        character.is_ascii_alphanumeric()
+            || "._-+".contains(character)
+            || (allow_at && character == '@')
+    }) {
+        return Err(TaskErrorKind::InvalidInput);
+    }
+    Ok(())
+}
+
+/// Validate a resource according to the package manager's native name grammar.
+/// Generic validation remains available for callers that only need path/option checks.
+pub fn validate_resource_name(
+    ecosystem: Ecosystem,
+    kind: ResourceKind,
+    name: &str,
+) -> Result<(), TaskErrorKind> {
+    match (ecosystem, kind) {
+        (Ecosystem::Homebrew, ResourceKind::Tap) => {
+            let mut parts = name.split('/');
+            let owner = parts.next().unwrap_or_default();
+            let repository = parts.next().unwrap_or_default();
+            if parts.next().is_some() {
+                return Err(TaskErrorKind::InvalidInput);
+            }
+            validate_segment(owner, false)?;
+            validate_segment(repository, false)
+        }
+        (Ecosystem::Npm, ResourceKind::Package) if name.starts_with('@') => {
+            let (scope, package) = name.split_once('/').ok_or(TaskErrorKind::InvalidInput)?;
+            validate_segment(scope.trim_start_matches('@'), false)?;
+            validate_segment(package, false)
+        }
+        (Ecosystem::Npm, ResourceKind::Package)
+        | (Ecosystem::Pip, ResourceKind::Package)
+        | (Ecosystem::Gem, ResourceKind::Package)
+        | (Ecosystem::Rustup, ResourceKind::Toolchain)
+        | (Ecosystem::Rustup, ResourceKind::Component)
+        | (Ecosystem::Rustup, ResourceKind::Target)
+        | (Ecosystem::Homebrew, ResourceKind::Formula)
+        | (Ecosystem::Homebrew, ResourceKind::Cask) => validate_segment(name, false),
+        _ => validate_name(name),
+    }
+}
+
 pub fn package_record(
     ecosystem: Ecosystem,
     kind: ResourceKind,
@@ -286,11 +374,22 @@ pub fn package_record(
 
 pub fn classify_command_error(result: &CommandResult) -> TaskErrorKind {
     let text = format!("{}\n{}", result.stderr, result.stdout).to_ascii_lowercase();
-    if text.contains("connection timed out")
+    if result.status.code() == Some(28) {
+        return TaskErrorKind::NetworkTimeout;
+    }
+    if (text.contains("timed out")
+        && (text.contains("connect")
+            || text.contains("network")
+            || text.contains("operation")
+            || text.contains("read")))
         || text.contains("connect timeout")
-        || text.contains("operation timed out")
-        || text.contains("network timeout")
+        || text.contains("readtimeout")
+        || text.contains("read timeout")
         || text.contains("could not resolve host")
+        || text.contains("could not resolve")
+        || text.contains("dns lookup failed")
+        || (text.contains("getaddrinfo")
+            && (text.contains("enotfound") || text.contains("eai_again")))
         || text.contains("temporary failure in name resolution")
         || text.contains("name or service not known")
     {
@@ -299,6 +398,11 @@ pub fn classify_command_error(result: &CommandResult) -> TaskErrorKind {
     if text.contains("proxy")
         && (text.contains("disconnect")
             || text.contains("connection refused")
+            || text.contains("cannot connect")
+            || text.contains("connection reset")
+            || text.contains("connection aborted")
+            || text.contains("econnrefused")
+            || text.contains("handshake failed")
             || text.contains("broken pipe")
             || text.contains("closed"))
     {
@@ -327,6 +431,23 @@ pub fn classify_command_error(result: &CommandResult) -> TaskErrorKind {
         return TaskErrorKind::InvalidInput;
     }
     TaskErrorKind::CommandFailed
+}
+
+pub fn classify_process_error(error: &ProcessError) -> TaskErrorKind {
+    match error {
+        ProcessError::Spawn(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            TaskErrorKind::CommandFailed
+        }
+        ProcessError::Spawn(source) if source.kind() == std::io::ErrorKind::PermissionDenied => {
+            TaskErrorKind::PermissionDenied
+        }
+        // A supervisor timeout has no evidence that the cause was the network; do not
+        // retry arbitrary long-running or hung local commands.
+        ProcessError::ProcessTimeout => TaskErrorKind::CommandFailed,
+        ProcessError::Cancelled | ProcessError::Io(_) | ProcessError::Spawn(_) => {
+            TaskErrorKind::CommandFailed
+        }
+    }
 }
 
 pub fn command(program: &str, args: impl IntoIterator<Item = impl AsRef<str>>) -> CommandSpec {
@@ -395,5 +516,23 @@ mod tests {
         );
         assert_eq!(validate_name("bad name"), Err(TaskErrorKind::InvalidInput));
         assert_eq!(validate_name(""), Err(TaskErrorKind::InvalidInput));
+    }
+
+    #[test]
+    fn resource_validation_keeps_scoped_and_tap_names_but_rejects_specs() {
+        assert!(
+            validate_resource_name(Ecosystem::Npm, ResourceKind::Package, "@scope/pkg").is_ok()
+        );
+        assert!(
+            validate_resource_name(Ecosystem::Homebrew, ResourceKind::Tap, "owner/repo").is_ok()
+        );
+        assert!(
+            validate_resource_name(Ecosystem::Homebrew, ResourceKind::Formula, "python@3.12")
+                .is_ok()
+        );
+        assert!(
+            validate_resource_name(Ecosystem::Pip, ResourceKind::Package, "file:../pkg").is_err()
+        );
+        assert!(validate_resource_name(Ecosystem::Npm, ResourceKind::Package, "../pkg").is_err());
     }
 }

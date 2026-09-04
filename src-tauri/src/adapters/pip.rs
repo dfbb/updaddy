@@ -7,7 +7,8 @@ use crate::core::{Ecosystem, Operation, PackageRecord, PackageTask, ResourceKind
 use crate::executor::{CommandResult, CommandSpec};
 
 use super::adapter::{
-    command, home_path, package_record, validate_name, EcosystemAdapter, ExecutorContext,
+    classify_process_error, command, home_path, package_record, validate_resource_name,
+    EcosystemAdapter, ExecutorContext,
 };
 use super::parsers::json_array_versions;
 
@@ -18,9 +19,10 @@ impl PipAdapter {
         Self
     }
 
-    pub async fn discover_install_paths(
+    async fn discover_install_paths_with_cancel(
         &self,
         context: &ExecutorContext,
+        cancel: CancellationToken,
     ) -> Result<Vec<PathBuf>, TaskErrorKind> {
         let result = context
             .run(
@@ -31,10 +33,10 @@ impl PipAdapter {
                         "import site; print('\\n'.join(site.getsitepackages()))",
                     ],
                 ),
-                CancellationToken::new(),
+                cancel,
             )
             .await
-            .map_err(|_| TaskErrorKind::CommandFailed)?;
+            .map_err(|error| classify_process_error(&error))?;
         if !result.status.success() {
             return Err(self.classify_error(&result));
         }
@@ -43,13 +45,21 @@ impl PipAdapter {
             .lines()
             .map(str::trim)
             .filter(|line| !line.is_empty())
-            .map(PathBuf::from)
+            .map(home_path)
             .collect();
         if paths.is_empty() {
             Err(TaskErrorKind::CommandFailed)
         } else {
             Ok(paths)
         }
+    }
+
+    pub async fn discover_install_paths(
+        &self,
+        context: &ExecutorContext,
+    ) -> Result<Vec<PathBuf>, TaskErrorKind> {
+        self.discover_install_paths_with_cancel(context, CancellationToken::new())
+            .await
     }
 }
 
@@ -95,7 +105,7 @@ impl EcosystemAdapter for PipAdapter {
                 cancel.clone(),
             )
             .await
-            .map_err(|_| TaskErrorKind::CommandFailed)?;
+            .map_err(|error| classify_process_error(&error))?;
         if !installed.status.success() {
             return Err(self.classify_error(&installed));
         }
@@ -108,7 +118,7 @@ impl EcosystemAdapter for PipAdapter {
                 cancel,
             )
             .await
-            .map_err(|_| TaskErrorKind::CommandFailed)?;
+            .map_err(|error| classify_process_error(&error))?;
         if !outdated.status.success() {
             return Err(self.classify_error(&outdated));
         }
@@ -131,13 +141,23 @@ impl EcosystemAdapter for PipAdapter {
             })
             .collect())
     }
+
+    async fn resolve_install_paths(
+        &self,
+        context: &ExecutorContext,
+        cancel: CancellationToken,
+    ) -> Result<Vec<PathBuf>, TaskErrorKind> {
+        self.discover_install_paths_with_cancel(context, cancel)
+            .await
+    }
+
     fn plan(&self, task: &PackageTask) -> Result<CommandSpec, TaskErrorKind> {
         if task.ecosystem != Ecosystem::Pip
             || !matches!(task.operation, Operation::Update | Operation::Uninstall)
         {
             return Err(TaskErrorKind::InvalidInput);
         }
-        validate_name(&task.name)?;
+        validate_resource_name(Ecosystem::Pip, ResourceKind::Package, &task.name)?;
         let args: Vec<String> = if matches!(task.operation, Operation::Update) {
             vec![
                 "-m".into(),
