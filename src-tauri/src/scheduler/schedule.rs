@@ -80,7 +80,8 @@ impl Schedule {
     }
 
     pub(crate) fn due_for_cycle(&self, cycle_id: &str) -> Option<i64> {
-        let date = NaiveDate::parse_from_str(cycle_id, "%Y-%m-%d").ok()
+        let date_part = cycle_id.rsplit_once(':').map_or(cycle_id, |(_, date)| date);
+        let date = NaiveDate::parse_from_str(date_part, "%Y-%m-%d").ok()
             .or_else(|| NaiveDate::parse_from_str(cycle_id, "%Y-W%W-%w").ok())?;
         let (date, time) = match self {
             Self::Daily { time } => (date, *time),
@@ -107,12 +108,29 @@ impl EnabledEcosystems {
 #[derive(Debug, Clone)]
 pub struct Scheduler {
     pub schedule: Schedule,
+    config_version: String,
 }
 
 impl Scheduler {
-    pub fn new(schedule: Schedule) -> Self { Self { schedule } }
+    pub fn new(schedule: Schedule) -> Self { Self { schedule, config_version: "v1".into() } }
+    pub fn with_config_version(schedule: Schedule, version: impl Into<String>) -> Self {
+        Self { schedule, config_version: version.into() }
+    }
     pub fn start(&self) {}
     pub fn next_due(&self, now: i64) -> i64 { self.schedule.next_due(now) }
+
+    /// 返回稳定周期标识；计划配置变更后不会复用旧周期记录。
+    pub fn cycle_id(&self, now: i64) -> String {
+        let current = Local.timestamp_opt(now, 0).single().unwrap_or_else(Local::now);
+        let date = match self.schedule {
+            Schedule::Daily { .. } => current.date_naive(),
+            Schedule::Weekly { .. } => {
+                let d = current.date_naive();
+                d - chrono::Duration::days(d.weekday().num_days_from_monday() as i64)
+            }
+        };
+        format!("{}:{}", self.config_version, date.format("%Y-%m-%d"))
+    }
 
     pub fn plan_visible_updates<I>(visible: EnabledEcosystems, snapshots: I) -> Vec<PackageTask>
     where I: IntoIterator<Item = PackageRecord> {

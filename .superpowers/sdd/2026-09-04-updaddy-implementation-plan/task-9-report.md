@@ -22,3 +22,4 @@ cargo test --manifest-path src-tauri/Cargo.toml scheduler:: -- --nocapture
 
 - 当前 `Scheduler::start()` 是无阻塞启动钩子，实际应用的定时器/系统唤醒事件接入留给后续 Tauri 平台任务。
 - 计划状态持久化提供通用键值 API；应用层需约定配置版本与周期 ID 的键格式。
+- `Scheduler::cycle_id` 已将配置版本与周期起始日期组合，供上述状态键值持久化使用。
