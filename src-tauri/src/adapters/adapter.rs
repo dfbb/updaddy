@@ -545,6 +545,10 @@ mod tests {
         );
         assert!(!classify_command_error(&result("invalid option")).is_retryable());
         assert!(!classify_command_error(&result("request timeout setting")).is_retryable());
+        assert!(
+            !classify_command_error(&result("ERESOLVE could not resolve dependency tree"))
+                .is_retryable()
+        );
     }
 
     #[test]
@@ -574,5 +578,19 @@ mod tests {
             validate_resource_name(Ecosystem::Pip, ResourceKind::Package, "file:../pkg").is_err()
         );
         assert!(validate_resource_name(Ecosystem::Npm, ResourceKind::Package, "../pkg").is_err());
+    }
+
+    #[test]
+    fn proxy_debug_redacts_values_and_rejects_non_proxy_keys() {
+        let proxy = ProxyEnv::new([
+            (
+                "HTTPS_PROXY".into(),
+                "socks5://user:secret@127.0.0.1:1080".into(),
+            ),
+            ("HOME".into(), "/private".into()),
+        ]);
+        let debug = format!("{proxy:?}");
+        assert!(!debug.contains("secret"));
+        assert!(!proxy.vars.contains_key("HOME"));
     }
 }
