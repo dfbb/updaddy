@@ -33,9 +33,26 @@ impl fmt::Debug for ProxyEnv {
 impl ProxyEnv {
     pub fn new(vars: impl IntoIterator<Item = (String, String)>) -> Self {
         Self {
-            vars: vars.into_iter().collect(),
+            vars: vars
+                .into_iter()
+                .filter(|(key, _)| is_proxy_env_key(key))
+                .collect(),
         }
     }
+}
+
+fn is_proxy_env_key(key: &str) -> bool {
+    matches!(
+        key,
+        "ALL_PROXY"
+            | "all_proxy"
+            | "HTTP_PROXY"
+            | "http_proxy"
+            | "HTTPS_PROXY"
+            | "https_proxy"
+            | "NO_PROXY"
+            | "no_proxy"
+    )
 }
 
 #[async_trait]
@@ -117,10 +134,26 @@ impl ExecutorContext {
     ) -> Result<CommandResult, ProcessError> {
         // ProcessSupervisor clears inherited variables. Restore only the allowlisted values
         // package managers need to resolve the active user's global installation.
-        let path = std::env::var("PATH").unwrap_or_else(|_| {
-            "/opt/homebrew/bin:/usr/local/bin:$HOME/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-                .replace("$HOME", &home_dir().to_string_lossy())
-        });
+        let mut path_entries = std::env::var("PATH")
+            .unwrap_or_default()
+            .split(':')
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        for required in [
+            "/opt/homebrew/bin".to_owned(),
+            "/usr/local/bin".to_owned(),
+            home_dir().join(".cargo/bin").to_string_lossy().into_owned(),
+            "/usr/bin".to_owned(),
+            "/bin".to_owned(),
+            "/usr/sbin".to_owned(),
+            "/sbin".to_owned(),
+        ] {
+            if !path_entries.iter().any(|entry| entry == &required) {
+                path_entries.push(required);
+            }
+        }
+        let path = path_entries.join(":");
         spec.env.entry("PATH".to_owned()).or_insert(path);
         spec.env
             .entry("HOME".to_owned())
@@ -140,7 +173,9 @@ impl ExecutorContext {
             }
         }
         for (key, value) in &self.proxy.vars {
-            spec.env.insert(key.clone(), value.clone());
+            if is_proxy_env_key(key) {
+                spec.env.insert(key.clone(), value.clone());
+            }
         }
         self.runner.run(spec, cancel).await
     }
@@ -389,7 +424,7 @@ pub fn classify_command_error(result: &CommandResult) -> TaskErrorKind {
         || text.contains("readtimeout")
         || text.contains("read timeout")
         || text.contains("could not resolve host")
-        || text.contains("could not resolve")
+        || text.contains("could not resolve registry")
         || text.contains("dns lookup failed")
         || text.contains("eai_again")
         || (text.contains("getaddrinfo")

@@ -112,43 +112,39 @@ impl EcosystemAdapter for HomebrewAdapter {
         let formula = self
             .run(
                 context,
-                command("brew", ["outdated", "--formula"]),
+                command("brew", ["outdated", "--formula", "--verbose"]),
                 cancel.clone(),
             )
             .await?;
         let cask = self
             .run(
                 context,
-                command("brew", ["outdated", "--cask"]),
+                command("brew", ["outdated", "--cask", "--verbose"]),
                 cancel.clone(),
             )
             .await?;
         let taps = self.run(context, command("brew", ["tap"]), cancel).await?;
-        let outdated_formula = lines(&formula.stdout)
-            .map(|line| line.split_whitespace().next().unwrap_or(line))
-            .collect::<std::collections::HashSet<_>>();
-        let outdated_cask = lines(&cask.stdout)
-            .map(|line| line.split_whitespace().next().unwrap_or(line))
-            .collect::<std::collections::HashSet<_>>();
+        let outdated_formula = outdated_versions(&formula.stdout);
+        let outdated_cask = outdated_versions(&cask.stdout);
         let mut records = Vec::new();
         for (name, current) in installed_versions(&formula_installed.stdout) {
-            let update = outdated_formula.contains(name.as_str());
+            let update = outdated_formula.get(&name);
             records.push(package_record(
                 Ecosystem::Homebrew,
                 ResourceKind::Formula,
                 name,
                 current,
-                update.then(|| "latest".into()),
+                update.and_then(|(_, target)| target.clone()),
             ));
         }
         for (name, current) in installed_versions(&cask_installed.stdout) {
-            let update = outdated_cask.contains(name.as_str());
+            let update = outdated_cask.get(&name);
             records.push(package_record(
                 Ecosystem::Homebrew,
                 ResourceKind::Cask,
                 format!("cask:{name}"),
                 current,
-                update.then(|| "latest".into()),
+                update.and_then(|(_, target)| target.clone()),
             ));
         }
         let changed_taps = changed_taps(&tap_refresh.stdout);
@@ -227,6 +223,33 @@ fn installed_versions(output: &str) -> impl Iterator<Item = (String, Option<Stri
         let version = fields.next().map(str::to_owned);
         (name, version)
     })
+}
+
+fn outdated_versions(
+    output: &str,
+) -> std::collections::HashMap<String, (Option<String>, Option<String>)> {
+    lines(output)
+        .filter_map(|line| {
+            let name = line.split_whitespace().next()?.to_owned();
+            let Some((_, rest)) = line.split_once(" (") else {
+                return Some((name, (None, Some("latest".to_owned()))));
+            };
+            let body = rest.strip_suffix(')')?.trim();
+            let (current, target) = body.split_once('<')?;
+            let current = current.trim();
+            let target = target.trim();
+            if target.is_empty() {
+                return None;
+            }
+            Some((
+                name,
+                (
+                    (!current.is_empty()).then(|| current.to_owned()),
+                    Some(target.to_owned()),
+                ),
+            ))
+        })
+        .collect()
 }
 
 fn changed_taps(output: &str) -> std::collections::HashSet<&str> {

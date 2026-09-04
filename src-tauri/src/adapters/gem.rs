@@ -98,17 +98,23 @@ impl EcosystemAdapter for GemAdapter {
                 .map(|version| version.strip_prefix("default: ").unwrap_or(version))
                 .filter(|version| !version.is_empty());
             for version in versions {
-                let (update_current, target) = updates
-                    .get(name)
-                    .cloned()
-                    .unwrap_or((Some(version.to_owned()), None));
+                let target = updates.get(name).and_then(|(expected, target)| {
+                    if expected
+                        .as_deref()
+                        .map_or(true, |current| current == version)
+                    {
+                        Some(target.clone())
+                    } else {
+                        None
+                    }
+                });
                 // Include the selected version in the task identity so uninstall never
                 // falls back to RubyGems' interactive multi-version prompt.
                 records.push(package_record(
                     Ecosystem::Gem,
                     ResourceKind::Package,
                     format!("{name}@{version}"),
-                    update_current.or_else(|| Some(version.to_owned())),
+                    Some(version.to_owned()),
                     target,
                 ));
             }
@@ -217,13 +223,17 @@ fn parse_outdated_line(line: &str) -> Option<(String, Option<String>, String)> {
         let current = (!current.is_empty()).then(|| current.to_owned());
         return Some((name.to_owned(), current, target.to_owned()));
     }
-    let target = body
-        .strip_prefix("newest ")?
-        .split(',')
-        .next()
-        .map(str::trim)
-        .unwrap_or_default();
-    (!name.is_empty() && !target.is_empty()).then(|| (name.to_owned(), None, target.to_owned()))
+    let newest = body.strip_prefix("newest ")?;
+    let target = newest.split(',').next().map(str::trim).unwrap_or_default();
+    let current = newest.split(',').find_map(|part| {
+        part.trim()
+            .strip_prefix("installed ")
+            .or_else(|| part.trim().strip_prefix("current "))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    });
+    (!name.is_empty() && !target.is_empty()).then(|| (name.to_owned(), current, target.to_owned()))
 }
 
 #[cfg(test)]
