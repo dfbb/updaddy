@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use chrono::Utc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -11,33 +10,12 @@ use crate::persistence::Database;
 use super::messages::WorkerCommand;
 use super::{WorkerEvent, WorkerEventSink};
 
-/// Minimal adapter contract. Concrete package-manager behavior belongs to Task 6.
-#[async_trait]
-pub trait EcosystemAdapter: Send + Sync + 'static {
-    async fn run(
-        &self,
-        command: WorkerCommand,
-        cancel: CancellationToken,
-    ) -> Result<(), TaskErrorKind>;
-}
+pub use crate::adapters::EcosystemAdapter;
 
 /// Adapter used when a worker has no implementation yet.
 pub struct NoopAdapter;
 
-#[async_trait]
-impl EcosystemAdapter for NoopAdapter {
-    async fn run(
-        &self,
-        _command: WorkerCommand,
-        cancel: CancellationToken,
-    ) -> Result<(), TaskErrorKind> {
-        if cancel.is_cancelled() {
-            Err(TaskErrorKind::Unknown)
-        } else {
-            Err(TaskErrorKind::Unknown)
-        }
-    }
-}
+impl EcosystemAdapter for NoopAdapter {}
 
 pub(crate) async fn run_command(
     ecosystem: Ecosystem,

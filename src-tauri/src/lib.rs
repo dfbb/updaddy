@@ -1,3 +1,4 @@
+pub mod adapters;
 pub mod core;
 pub mod executor;
 pub mod persistence;
