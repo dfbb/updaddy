@@ -357,7 +357,7 @@ mod tests {
     async fn output_reader_preserves_utf8_split_across_chunks() {
         let (mut writer, reader) = tokio::io::duplex(16);
         let write_task = tokio::spawn(async move {
-            writer.write_all(&[b'c', 0xc3]).await.unwrap();
+            writer.write_all(&[b'c', b'a', b'f', 0xc3]).await.unwrap();
             writer.write_all(&[0xa9, b'\n']).await.unwrap();
         });
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
