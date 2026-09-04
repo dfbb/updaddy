@@ -29,3 +29,5 @@
     --color-accent: #60a5fa;
   }
 }
+:root { color-scheme: light; --bg: #f7f7f8; --fg: #1f2328; }
+:root[data-theme="dark"] { color-scheme: dark; --bg: #1f2328; --fg: #f0f3f6; }

@@ -1,0 +1,30 @@
+overview: Overview
+ecosystems:
+  homebrew: Homebrew
+  npm: npm
+  pip: pip
+  gem: RubyGems
+  rustup: rustup
+task:
+  pending: Pending
+  running: Running
+  succeeded: Succeeded
+  failed: Failed
+  cancelled: Cancelled
+  cancel: Cancel
+buttons:
+  update_all: Update all
+  open: Open main window
+  settings: Settings
+  quit: Quit
+  update: Update
+  uninstall: Uninstall
+settings:
+  title: Settings
+  theme: Theme
+  locale: Language
+  proxy: Proxy
+  schedule: Schedule
+logs:
+  title: Logs
+confirm_uninstall: Uninstall this package?

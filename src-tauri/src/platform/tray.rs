@@ -10,7 +10,7 @@ pub fn setup(app: &AppHandle) -> Result<(), String> {
     let quit = PredefinedMenuItem::quit(app, Some("退出")).map_err(|e| e.to_string())?;
     let menu = MenuBuilder::new(app).items(&[&count, &update, &open, &settings, &quit]).build().map_err(|e| e.to_string())?;
     let mut tray = TrayIconBuilder::new().menu(&menu).tooltip("updaddy");
-    if let Some(icon) = app.default_window_icon() { tray = tray.icon(icon.clone()); }
+    if let Some(icon) = app.default_window_icon() { tray = tray.icon(icon.clone()).icon_as_template(true); }
     tray.on_menu_event(|app, event| match event.id().as_ref() { "open"|"count" => { if let Some(w)=app.get_webview_window("main") { let _=w.show(); let _=w.set_focus(); } }, "settings" => { if let Some(w)=app.get_webview_window("main") { let _=w.show(); let _=w.set_focus(); let _=w.emit("open-settings", ()); } }, "update" => { let _=app.emit("tray-update-all", ()); }, _=>{} }).build(app).map_err(|e| e.to_string())?;
     Ok(())
 }

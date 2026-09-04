@@ -12,9 +12,10 @@ pub mod workers;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() -> tauri::Result<()> {
-    let database = crate::persistence::Database::open_default()
-        .ok()
-        .map(std::sync::Arc::new);
+    let database = Some(std::sync::Arc::new(
+        crate::persistence::Database::open_default()
+            .map_err(|e| tauri::Error::Setup((Box::new(e) as Box<dyn std::error::Error>).into()))?,
+    ));
     let state = crate::commands::AppState::new(database);
     let event_bus = state.event_bus.clone();
     tauri::Builder::default()

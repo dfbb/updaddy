@@ -28,3 +28,5 @@ body {
 .app-shell p {
   color: var(--color-muted);
 }
+.app-shell { min-height: 100vh; padding: 2rem; box-sizing: border-box; background: var(--bg); color: var(--fg); font-family: -apple-system, BlinkMacSystemFont, sans-serif; }
+header { display: flex; gap: .75rem; align-items: center; } .update-count { font-weight: 700; }

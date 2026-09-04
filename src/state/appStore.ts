@@ -1,0 +1,14 @@
+import { useSyncExternalStore } from "react";
+import type { BackendEvent, Ecosystem, LogEntry, PackageRecord, PackageTask, Settings, StateSnapshot, ThemeMode } from "../types";
+import { resolveLocale, setTheme } from "../theme/theme";
+type Listener = () => void;
+export interface AppState { locale: string; theme: ThemeMode; visibleEcosystems: Ecosystem[]; packages: PackageRecord[]; tasks: PackageTask[]; logs: LogEntry[]; workers: Record<string, string>; activeTaskIds: string[]; operationsDisabled: boolean; totalUpdates: number; }
+let state: AppState = { locale: resolveLocale(), theme: "system", visibleEcosystems: ["homebrew", "npm", "pip", "gem", "rustup"], packages: [], tasks: [], logs: [], workers: {}, activeTaskIds: [], operationsDisabled: false, totalUpdates: 0 };
+const listeners = new Set<Listener>();
+const emit = () => listeners.forEach((l) => l());
+const setState = (next: Partial<AppState>) => { state = { ...state, ...next }; emit(); };
+export function useAppStore<T = AppState>(selector: (s: AppState) => T = ((s) => s as T)) { return useSyncExternalStore((l) => { listeners.add(l); return () => listeners.delete(l); }, () => selector(state), () => selector(state)); }
+export function setSettings(settings: Settings) { setTheme(settings.theme); setState({ locale: resolveLocale(settings.locale), theme: settings.theme, visibleEcosystems: settings.visible_ecosystems }); }
+export function applySnapshot(snapshot: StateSnapshot) { const active = snapshot.tasks.filter((t) => t.status === "pending" || t.status === "running").map((t) => t.task_id); setState({ workers: snapshot.workers, packages: snapshot.packages, logs: snapshot.logs, tasks: snapshot.tasks, activeTaskIds: active, operationsDisabled: snapshot.active_tasks > 0, totalUpdates: snapshot.packages.filter((p) => p.update_available && state.visibleEcosystems.includes(p.ecosystem)).length }); }
+export function applyEvent(name: string, payload: BackendEvent) { let tasks = state.tasks; if (name === "task-progress") tasks = tasks.map((t) => t.task_id === payload.task_id ? { ...t, status: payload.status, error: payload.error } : t); const packages = name === "package-changed" ? [...state.packages.filter((p) => p.id !== payload.package.id), payload.package] : state.packages; const logs = name === "log-entry" ? [...state.logs, payload.entry] : state.logs; const workers = name === "worker-state" ? { ...state.workers, [payload.ecosystem]: payload.state } : state.workers; const active = tasks.filter((t) => t.status === "pending" || t.status === "running").map((t) => t.task_id); setState({ tasks, packages, logs, workers, activeTaskIds: active, operationsDisabled: active.length > 0, totalUpdates: packages.filter((p) => p.update_available && state.visibleEcosystems.includes(p.ecosystem)).length }); }
+export const getAppState = () => state;

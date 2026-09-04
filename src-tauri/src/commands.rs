@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
-use tauri::{State, Manager};
+use tauri::{State, Manager, Emitter};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -259,6 +259,7 @@ pub fn save_settings(app: State<'_, AppState>, settings: Settings) -> Result<(),
 #[tauri::command]
 pub fn set_login_item(app: State<'_, AppState>, handle: tauri::AppHandle, enabled: bool) -> Result<(), String> {
     crate::platform::login_item::set_enabled(&handle, enabled)?;
+    if let Some(db) = &app.database { let mut settings = app.settings.lock().unwrap_or_else(|p| p.into_inner()).clone(); settings.login_item = enabled; db.save_setting("settings", &serde_json::to_string(&settings).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?; }
     app.settings
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -268,7 +269,7 @@ pub fn set_login_item(app: State<'_, AppState>, handle: tauri::AppHandle, enable
 
 #[tauri::command]
 pub fn open_settings(app: tauri::AppHandle) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window("main") { window.show().map_err(|e| e.to_string())?; window.set_focus().map_err(|e| e.to_string())?; }
+    if let Some(window) = app.get_webview_window("main") { window.show().map_err(|e| e.to_string())?; window.set_focus().map_err(|e| e.to_string())?; let _ = window.emit("open-settings", ()); }
     Ok(())
 }
 
