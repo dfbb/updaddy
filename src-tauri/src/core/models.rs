@@ -127,7 +127,7 @@ mod tests {
     fn task_error_kind_marks_only_transient_errors_retryable() {
         assert!(TaskErrorKind::NetworkTimeout.is_retryable());
         assert!(TaskErrorKind::ProxyDisconnected.is_retryable());
-        assert!(TaskErrorKind::Http5xx.is_retryable());
+        assert!(TaskErrorKind::HttpServerTemporaryError.is_retryable());
         assert!(!TaskErrorKind::PermissionDenied.is_retryable());
     }
 }

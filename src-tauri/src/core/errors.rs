@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 pub enum TaskErrorKind {
     NetworkTimeout,
     ProxyDisconnected,
-    Http5xx,
+    HttpServerTemporaryError,
     PermissionDenied,
     CommandFailed,
     InvalidInput,
@@ -16,7 +16,7 @@ impl TaskErrorKind {
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
-            Self::NetworkTimeout | Self::ProxyDisconnected | Self::Http5xx
+            Self::NetworkTimeout | Self::ProxyDisconnected | Self::HttpServerTemporaryError
         )
     }
 }
