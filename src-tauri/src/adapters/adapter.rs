@@ -337,7 +337,10 @@ pub fn validate_resource_name(
         }
         (Ecosystem::Npm, ResourceKind::Package) if name.starts_with('@') => {
             let (scope, package) = name.split_once('/').ok_or(TaskErrorKind::InvalidInput)?;
-            validate_segment(scope.trim_start_matches('@'), false)?;
+            if scope.len() < 2 || scope[1..].contains('@') {
+                return Err(TaskErrorKind::InvalidInput);
+            }
+            validate_segment(&scope[1..], false)?;
             validate_segment(package, false)
         }
         (Ecosystem::Npm, ResourceKind::Package)
@@ -388,6 +391,7 @@ pub fn classify_command_error(result: &CommandResult) -> TaskErrorKind {
         || text.contains("could not resolve host")
         || text.contains("could not resolve")
         || text.contains("dns lookup failed")
+        || text.contains("eai_again")
         || (text.contains("getaddrinfo")
             && (text.contains("enotfound") || text.contains("eai_again")))
         || text.contains("temporary failure in name resolution")
@@ -395,9 +399,10 @@ pub fn classify_command_error(result: &CommandResult) -> TaskErrorKind {
     {
         return TaskErrorKind::NetworkTimeout;
     }
-    if text.contains("proxy")
+    if (text.contains("proxy") || text.contains("socks"))
         && (text.contains("disconnect")
             || text.contains("connection refused")
+            || text.contains("connection failed")
             || text.contains("cannot connect")
             || text.contains("connection reset")
             || text.contains("connection aborted")
