@@ -44,6 +44,8 @@ pub enum SupervisorError {
     UnknownTask(Uuid),
     #[error("task {0} is already active")]
     DuplicateTask(Uuid),
+    #[error("another operation batch is already running")]
+    BatchInProgress,
 }
 
 pub type Result<T> = std::result::Result<T, SupervisorError>;
@@ -59,6 +61,7 @@ pub struct WorkerSupervisor {
     cancellations: Arc<Mutex<HashMap<Uuid, CancellationToken>>>,
     handles: Mutex<Vec<JoinHandle<()>>>,
     database: Option<Arc<Database>>,
+    batch_gate: Mutex<()>,
 }
 
 impl WorkerSupervisor {
@@ -205,8 +208,21 @@ impl WorkerSupervisor {
             cancellations,
             handles: Mutex::new(handles),
             database: context.database,
+            batch_gate: Mutex::new(()),
         }
     }
+
+    /// 原子地投递一组命令。计划批次可在投递前检查 `active_task_count`，
+    /// 从而在手动批次运行时等待，而不会重复创建任务。
+    pub fn submit_batch(&self, commands: Vec<WorkerCommand>) -> Result<Vec<Uuid>> {
+        let _guard = self.batch_gate.lock().unwrap_or_else(|p| p.into_inner());
+        if self.active_task_count() > 0 {
+            return Err(SupervisorError::BatchInProgress);
+        }
+        commands.into_iter().map(|command| self.submit(command)).collect()
+    }
+
+    pub fn is_batch_active(&self) -> bool { self.active_task_count() > 0 }
 
     pub fn submit(&self, command: WorkerCommand) -> Result<Uuid> {
         if matches!(command, WorkerCommand::Shutdown) {

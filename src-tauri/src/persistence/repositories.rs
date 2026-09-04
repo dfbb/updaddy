@@ -63,6 +63,25 @@ fn parse_enum<T: serde::de::DeserializeOwned>(value: &str, field: &str) -> Resul
 }
 
 impl Database {
+    /// 保存计划状态；键和值均由 scheduler 负责定义，便于未来扩展而无需改表结构。
+    pub fn save_scheduler_state(&self, key: &str, value: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO scheduler_state(key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_scheduler_state(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT value FROM scheduler_state WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        ).optional().map_err(Into::into)
+    }
+
     pub fn save_snapshot(&self, snapshot: &PackageRecord) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;

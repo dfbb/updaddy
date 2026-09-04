@@ -4,6 +4,7 @@ pub mod disk_usage;
 pub mod executor;
 pub mod persistence;
 pub mod proxy;
+pub mod scheduler;
 pub mod workers;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
