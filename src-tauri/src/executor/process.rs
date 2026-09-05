@@ -85,6 +85,8 @@ pub enum ProcessError {
     ProcessTimeout,
     #[error("command was cancelled by the user")]
     Cancelled,
+    #[error("proxy error: {0}")]
+    Proxy(#[source] crate::proxy::ProxyError),
 }
 
 impl ProcessError {
@@ -136,7 +138,6 @@ impl ProcessSupervisor {
 
         #[cfg(unix)]
         {
-            use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
 
@@ -223,17 +224,16 @@ async fn read_output<R: AsyncRead + Unpin>(
         }
         bytes.extend_from_slice(&chunk[..count]);
         pending.extend_from_slice(&chunk[..count]);
-        while !has_multiline_secret {
-            let Some(newline) = pending.iter().position(|byte| *byte == b'\n') else {
-                break;
-            };
-            let mut line = pending.drain(..=newline).collect::<Vec<_>>();
-            line.pop();
-            if line.last() == Some(&b'\r') {
+        if !has_multiline_secret {
+            while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+                let mut line = pending.drain(..=newline).collect::<Vec<_>>();
                 line.pop();
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                let line = String::from_utf8_lossy(&line);
+                emit_line(&line, stream, &event_sink, &secrets);
             }
-            let line = String::from_utf8_lossy(&line);
-            emit_line(&line, stream, &event_sink, &secrets);
         }
     }
     if has_multiline_secret {

@@ -8,6 +8,7 @@ pub enum WorkerCommand {
     Scan(Ecosystem),
     Update(PackageTask),
     Uninstall(PackageTask),
+    Retry(PackageTask),
     RefreshDiskUsage(PackageRecord),
     Shutdown,
 }
@@ -17,14 +18,14 @@ impl WorkerCommand {
         match self {
             Self::Scan(ecosystem) => Some(*ecosystem),
             Self::RefreshDiskUsage(package) => Some(package.ecosystem),
-            Self::Update(task) | Self::Uninstall(task) => Some(task.ecosystem),
+            Self::Update(task) | Self::Uninstall(task) | Self::Retry(task) => Some(task.ecosystem),
             Self::Shutdown => None,
         }
     }
 
     pub(crate) fn task_id(&self) -> Option<Uuid> {
         match self {
-            Self::Update(task) | Self::Uninstall(task) => Some(task.task_id),
+            Self::Update(task) | Self::Uninstall(task) | Self::Retry(task) => Some(task.task_id),
             Self::Scan(_) | Self::RefreshDiskUsage(_) | Self::Shutdown => None,
         }
     }

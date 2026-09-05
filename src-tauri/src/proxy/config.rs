@@ -90,16 +90,31 @@ impl ProxyConfig {
     }
 
     pub(crate) fn endpoint(&self) -> String {
-        format!("{}:{}", self.host, self.port)
+        format!("{}:{}", self.url_host(), self.port)
     }
 
     pub(crate) fn url(&self) -> String {
-        let mut url = format!("socks5://{}", self.host);
+        let host = self.url_host();
+        let mut url = format!("socks5://{host}");
         if let Some(username) = &self.username {
             let password = self.password.as_deref().unwrap_or("");
-            url = format!("socks5://{}:{}@{}", username, password, self.host);
+            url = format!(
+                "socks5://{}:{}@{host}",
+                encode_userinfo(username),
+                encode_userinfo(password)
+            );
         }
         format!("{}:{}", url, self.port)
+    }
+
+    fn url_host(&self) -> String {
+        if self.host.starts_with('[') && self.host.ends_with(']') {
+            self.host.clone()
+        } else if self.host.contains(':') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        }
     }
 
     #[cfg(test)]
@@ -112,6 +127,20 @@ impl ProxyConfig {
             password: None,
         }
     }
+}
+
+fn encode_userinfo(value: &str) -> String {
+    value
+        .bytes()
+        .flat_map(|byte| {
+            if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+                vec![byte as char]
+            } else {
+                let hex = format!("%{byte:02X}");
+                hex.chars().collect()
+            }
+        })
+        .collect()
 }
 
 #[derive(Clone)]
@@ -180,8 +209,7 @@ impl ProxyRuntime {
                             .map_err(|_| ProxyError::BridgeFailed)?,
                     );
                 }
-                let port = guard.as_ref().expect("bridge inserted").port();
-                let proxy = format!("http://127.0.0.1:{port}");
+                let proxy = guard.as_ref().expect("bridge inserted").proxy_url();
                 Ok(ProxyEnv::new([
                     (String::from("HTTP_PROXY"), proxy.clone()),
                     (String::from("HTTPS_PROXY"), proxy),
@@ -210,6 +238,28 @@ mod tests {
         assert_eq!(config.host, "example.test");
         assert_eq!(config.port, 1080);
         assert_eq!(config.username.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn proxy_url_percent_encodes_credentials() {
+        let config = ProxyConfig {
+            mode: ProxyMode::Socks5,
+            host: "example.test".into(),
+            port: 1080,
+            username: Some("alice@example".into()),
+            password: Some("p@ss:word".into()),
+        };
+        assert_eq!(
+            config.url(),
+            "socks5://alice%40example:p%40ss%3Aword@example.test:1080"
+        );
+    }
+
+    #[test]
+    fn proxy_url_and_endpoint_bracket_ipv6_hosts() {
+        let config = ProxyConfig::parse("socks5://[::1]:1080").unwrap();
+        assert_eq!(config.endpoint(), "[::1]:1080");
+        assert_eq!(config.url(), "socks5://[::1]:1080");
     }
 
     #[tokio::test]

@@ -16,6 +16,7 @@ use uuid::Uuid;
 pub type TaskId = Uuid;
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
 pub enum WorkerEvent {
     WorkerState {
         ecosystem: Ecosystem,

@@ -23,7 +23,6 @@ pub type Result<T> = std::result::Result<T, PersistenceError>;
 
 pub struct Database {
     pub(crate) conn: Mutex<Connection>,
-    pub(crate) path: PathBuf,
 }
 
 impl Database {
@@ -44,7 +43,6 @@ impl Database {
         migrations::run(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
-            path,
         })
     }
 

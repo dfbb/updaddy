@@ -24,6 +24,7 @@ pub struct SupervisorContext {
     pub database: Option<Arc<Database>>,
     pub event_sink: WorkerEventSink,
     pub executor: ExecutorContext,
+    pub detect_on_start: bool,
 }
 
 pub type WorkerContext = SupervisorContext;
@@ -35,6 +36,7 @@ impl SupervisorContext {
             database: None,
             event_sink,
             executor: ExecutorContext::new(),
+            detect_on_start: false,
         }
     }
 }
@@ -49,6 +51,8 @@ pub enum SupervisorError {
     DuplicateTask(Uuid),
     #[error("another operation batch is already running")]
     BatchInProgress,
+    #[error("worker supervisor is shutting down")]
+    ShuttingDown,
 }
 
 pub type Result<T> = std::result::Result<T, SupervisorError>;
@@ -83,6 +87,7 @@ impl WorkerSupervisor {
             let sink = context.event_sink.clone();
             let database = context.database.clone();
             let executor = context.executor.clone();
+            let detect_on_start = context.detect_on_start;
             let active = cancellations.clone();
             let lock = shared_resource_lock(resource_lock_key(ecosystem));
             (context.event_sink)(WorkerEvent::WorkerState {
@@ -103,6 +108,19 @@ impl WorkerSupervisor {
                     return;
                 };
                 let mut sequence = 0;
+                if detect_on_start {
+                    let detect_state = runtime.block_on(adapter.detect(&executor)).map_or(
+                        "unavailable",
+                        |available| if available { "idle" } else { "missing" },
+                    );
+                    sequence += 1;
+                    sink(WorkerEvent::WorkerState {
+                        ecosystem,
+                        sequence,
+                        state: detect_state.into(),
+                        emitted_at: chrono::Utc::now().timestamp(),
+                    });
+                }
                 while let Ok(envelope) = rx.recv() {
                     if envelope.command.ecosystem().is_none() {
                         break;
@@ -283,6 +301,9 @@ impl WorkerSupervisor {
     }
 
     pub fn submit(&self, command: WorkerCommand) -> Result<Uuid> {
+        if self.shutdown_started.load(Ordering::Acquire) {
+            return Err(SupervisorError::ShuttingDown);
+        }
         if matches!(command, WorkerCommand::Shutdown) {
             let id = Uuid::new_v4();
             for sender in self.senders.values() {
@@ -566,6 +587,7 @@ mod tests {
             database: None,
             event_sink: events.sink(),
             executor: crate::adapters::ExecutorContext::new(),
+            detect_on_start: false,
         });
         let brew = supervisor
             .submit(WorkerCommand::Scan(Ecosystem::Homebrew))
@@ -597,6 +619,7 @@ mod tests {
             database: None,
             event_sink: events.sink(),
             executor: crate::adapters::ExecutorContext::new(),
+            detect_on_start: false,
         });
         let first = supervisor
             .submit(WorkerCommand::Update(package_task(Ecosystem::Pip, "a")))
@@ -630,6 +653,7 @@ mod tests {
             database: None,
             event_sink: events.sink(),
             executor: crate::adapters::ExecutorContext::new(),
+            detect_on_start: false,
         });
         let task = supervisor
             .submit(WorkerCommand::Update(package_task(

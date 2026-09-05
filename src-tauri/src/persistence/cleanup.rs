@@ -28,7 +28,6 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::core::LogEntry;
     use crate::persistence::{Database, DiskUsageCacheEntry};
 

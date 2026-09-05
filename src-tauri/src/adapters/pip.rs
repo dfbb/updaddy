@@ -25,9 +25,9 @@ impl PipAdapter {
         cancel: CancellationToken,
     ) -> Result<Vec<PathBuf>, TaskErrorKind> {
         let result = context
-            .run(
+            .run_direct(
                 command(
-                    "python",
+                    "python3",
                     [
                         "-c",
                         "import site; print('\\n'.join([*site.getsitepackages(), site.getusersitepackages()]))",
@@ -78,8 +78,8 @@ impl EcosystemAdapter for PipAdapter {
     }
     async fn detect(&self, context: &ExecutorContext) -> Result<bool, TaskErrorKind> {
         match context
-            .run(
-                command("python", ["-m", "pip", "--version"]),
+            .run_direct(
+                command("python3", ["-m", "pip", "--version"]),
                 CancellationToken::new(),
             )
             .await
@@ -101,7 +101,7 @@ impl EcosystemAdapter for PipAdapter {
     ) -> Result<Vec<PackageRecord>, TaskErrorKind> {
         let installed = context
             .run(
-                command("python", ["-m", "pip", "list", "--format=json"]),
+                command("python3", ["-m", "pip", "list", "--format=json"]),
                 cancel.clone(),
             )
             .await
@@ -112,7 +112,7 @@ impl EcosystemAdapter for PipAdapter {
         let outdated = context
             .run(
                 command(
-                    "python",
+                    "python3",
                     ["-m", "pip", "list", "--outdated", "--format=json"],
                 ),
                 cancel,
@@ -175,7 +175,7 @@ impl EcosystemAdapter for PipAdapter {
                 task.name.clone(),
             ]
         };
-        Ok(command("python", args))
+        Ok(command("python3", args))
     }
     fn install_paths(&self) -> Vec<PathBuf> {
         vec![

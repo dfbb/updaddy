@@ -10,23 +10,23 @@
 
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --color-background: #111827;
-  --color-surface: #1f2937;
-  --color-text: #f9fafb;
-  --color-muted: #9ca3af;
-  --color-border: #374151;
-  --color-accent: #60a5fa;
+  --color-background: #171918;
+  --color-surface: #222522;
+  --color-text: #f3f5f3;
+  --color-muted: #a5aaa5;
+  --color-border: #3b403b;
+  --color-accent: #69c17d;
 }
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     color-scheme: dark;
-    --color-background: #111827;
-    --color-surface: #1f2937;
-    --color-text: #f9fafb;
-    --color-muted: #9ca3af;
-    --color-border: #374151;
-    --color-accent: #60a5fa;
+    --color-background: #171918;
+    --color-surface: #222522;
+    --color-text: #f3f5f3;
+    --color-muted: #a5aaa5;
+    --color-border: #3b403b;
+    --color-accent: #69c17d;
   }
 }
 :root { color-scheme: light; --bg: #f7f7f8; --fg: #1f2328; }

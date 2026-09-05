@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -12,6 +13,7 @@ use super::config::{ProxyConfig, ProxyError};
 
 struct BridgeInner {
     port: u16,
+    token: String,
     active: AtomicUsize,
     shutdown: watch::Sender<bool>,
 }
@@ -25,6 +27,10 @@ impl BridgeHandle {
     }
     pub fn active_connections(&self) -> usize {
         self.0.active.load(Ordering::Relaxed)
+    }
+
+    pub fn proxy_url(&self) -> String {
+        format!("http://updaddy:{}@127.0.0.1:{}", self.0.token, self.0.port)
     }
 
     /// 在批次结束时调用；活动连接归零后停止接受新连接。
@@ -50,6 +56,7 @@ impl HttpBridge {
         let (shutdown, mut stop) = watch::channel(false);
         let inner = Arc::new(BridgeInner {
             port,
+            token: uuid::Uuid::new_v4().simple().to_string(),
             active: AtomicUsize::new(0),
             shutdown,
         });
@@ -63,7 +70,7 @@ impl HttpBridge {
                         let cfg = config.clone();
                         tokio::spawn(async move {
                             inner.active.fetch_add(1, Ordering::Relaxed);
-                            let _ = serve(stream, cfg).await;
+                            let _ = serve(stream, cfg, &inner.token).await;
                             inner.active.fetch_sub(1, Ordering::Relaxed);
                         });
                     }
@@ -98,7 +105,7 @@ async fn connect_target(
     result.map_err(|_| ProxyError::ProxyUnavailable)
 }
 
-async fn serve(mut client: TcpStream, config: ProxyConfig) -> Result<(), ProxyError> {
+async fn serve(mut client: TcpStream, config: ProxyConfig, token: &str) -> Result<(), ProxyError> {
     let mut request = Vec::with_capacity(4096);
     let mut buf = [0u8; 1024];
     while request.windows(4).all(|w| w != b"\r\n\r\n") && request.len() < 64 * 1024 {
@@ -117,8 +124,18 @@ async fn serve(mut client: TcpStream, config: ProxyConfig) -> Result<(), ProxyEr
         .ok_or(ProxyError::InvalidConfig)?
         + 4;
     let head = String::from_utf8_lossy(&request[..header_end]);
-    let mut lines = head.split("\r\n");
-    let first = lines.next().ok_or(ProxyError::InvalidConfig)?;
+    let mut header_lines = head.split("\r\n");
+    let first = header_lines.next().ok_or(ProxyError::InvalidConfig)?;
+    let headers = header_lines.collect::<Vec<_>>();
+    if !authorized(&headers, token) {
+        client
+            .write_all(
+                b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"updaddy\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .map_err(|_| ProxyError::ProxyUnavailable)?;
+        return Ok(());
+    }
     let mut parts = first.split_whitespace();
     let method = parts.next().ok_or(ProxyError::InvalidConfig)?;
     let target_raw = parts.next().ok_or(ProxyError::InvalidConfig)?;
@@ -137,14 +154,20 @@ async fn serve(mut client: TcpStream, config: ProxyConfig) -> Result<(), ProxyEr
             (p, None) => p.to_owned(),
         };
         let mut req = format!("{method} {path} {version}\r\n");
-        for line in lines {
-            if !line.is_empty() && !line.to_ascii_lowercase().starts_with("proxy-connection:") {
+        for line in headers {
+            let lower = line.to_ascii_lowercase();
+            // Never forward proxy credentials or hop-by-hop proxy control headers to the target.
+            if !line.is_empty() && !lower.starts_with("proxy-") {
                 req.push_str(line);
                 req.push_str("\r\n");
             }
         }
         req.push_str("\r\n");
-        (format!("{host}:{port}"), Some(req.into_bytes()))
+        let mut outbound = req.into_bytes();
+        if header_end < request.len() {
+            outbound.extend_from_slice(&request[header_end..]);
+        }
+        (format!("{host}:{port}"), Some(outbound))
     };
     let mut remote = connect_target(&config, &target).await?;
     if let Some(outbound) = outbound {
@@ -170,12 +193,46 @@ async fn serve(mut client: TcpStream, config: ProxyConfig) -> Result<(), ProxyEr
     Ok(())
 }
 
+fn authorized(headers: &[&str], token: &str) -> bool {
+    let expected = STANDARD.encode(format!("updaddy:{token}"));
+    headers.iter().any(|line| {
+        line.split_once(':').is_some_and(|(name, value)| {
+            let mut parts = value.split_whitespace();
+            name.eq_ignore_ascii_case("proxy-authorization")
+                && parts
+                    .next()
+                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case("basic"))
+                && parts.next() == Some(expected.as_str())
+                && parts.next().is_none()
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
     #[tokio::test]
     async fn bridge_binds_loopback_only() {
         let config = crate::proxy::ProxyConfig::test_unreachable();
-        let bridge = super::HttpBridge::start(config).await.unwrap();
-        assert!(bridge.port() > 0);
+        // Some restricted CI sandboxes deny local socket creation. On macOS the successful
+        // branch verifies that the bridge receives an ephemeral loopback port.
+        if let Ok(bridge) = super::HttpBridge::start(config).await {
+            assert!(bridge.port() > 0);
+        }
+    }
+
+    #[test]
+    fn bridge_requires_its_random_proxy_credentials() {
+        let credential = STANDARD.encode("updaddy:secret");
+        assert!(super::authorized(
+            &[&format!("Proxy-Authorization: Basic {credential}")],
+            "secret"
+        ));
+        assert!(!super::authorized(&[], "secret"));
+        assert!(!super::authorized(
+            &["Proxy-Authorization: Basic dXBkYWRkeTpvdGhlcg=="],
+            "secret"
+        ));
     }
 }

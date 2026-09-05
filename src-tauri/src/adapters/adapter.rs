@@ -1,15 +1,18 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::RwLock;
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use crate::core::{Ecosystem, Operation, PackageRecord, PackageTask, ResourceKind, TaskErrorKind};
+use crate::core::{Ecosystem, PackageRecord, PackageTask, ResourceKind, TaskErrorKind};
 use crate::disk_usage::{resolve_package_paths, PackageInstallPaths};
-use crate::executor::{sink, CommandResult, CommandSpec, ProcessError, ProcessSupervisor};
-use crate::proxy::is_proxy_env_key;
+use crate::executor::{
+    sink, CommandResult, CommandSpec, EventSink, ProcessError, ProcessSupervisor,
+};
 pub use crate::proxy::ProxyEnv;
+use crate::proxy::{is_proxy_env_key, ProxyCapability, ProxyConfig, ProxyRuntime};
 use crate::workers::WorkerCommand;
 
 #[async_trait]
@@ -21,7 +24,17 @@ pub trait CommandRunner: Send + Sync {
     ) -> Result<CommandResult, ProcessError>;
 }
 
-pub struct ProcessCommandRunner;
+pub struct ProcessCommandRunner {
+    output_sink: EventSink,
+}
+
+impl Default for ProcessCommandRunner {
+    fn default() -> Self {
+        Self {
+            output_sink: sink(),
+        }
+    }
+}
 
 #[async_trait]
 impl CommandRunner for ProcessCommandRunner {
@@ -30,7 +43,7 @@ impl CommandRunner for ProcessCommandRunner {
         spec: CommandSpec,
         cancel: CancellationToken,
     ) -> Result<CommandResult, ProcessError> {
-        ProcessSupervisor::run(spec, cancel, sink()).await
+        ProcessSupervisor::run(spec, cancel, self.output_sink.clone()).await
     }
 }
 
@@ -39,6 +52,7 @@ impl CommandRunner for ProcessCommandRunner {
 pub struct ExecutorContext {
     pub proxy: ProxyEnv,
     runner: Arc<dyn CommandRunner>,
+    proxy_runtime: Arc<RwLock<Option<Arc<ProxyRuntime>>>>,
 }
 
 pub fn home_dir() -> PathBuf {
@@ -68,7 +82,8 @@ impl ExecutorContext {
     pub fn new() -> Self {
         Self {
             proxy: ProxyEnv::default(),
-            runner: Arc::new(ProcessCommandRunner),
+            runner: Arc::new(ProcessCommandRunner::default()),
+            proxy_runtime: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -76,6 +91,15 @@ impl ExecutorContext {
         Self {
             proxy: ProxyEnv::default(),
             runner,
+            proxy_runtime: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    pub fn with_output_sink(output_sink: EventSink) -> Self {
+        Self {
+            proxy: ProxyEnv::default(),
+            runner: Arc::new(ProcessCommandRunner { output_sink }),
+            proxy_runtime: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -84,19 +108,60 @@ impl ExecutorContext {
         self
     }
 
+    pub fn set_proxy_config(&self, config: Option<ProxyConfig>) {
+        let runtime = config.map(|config| Arc::new(ProxyRuntime::new(config)));
+        *self
+            .proxy_runtime
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = runtime;
+    }
+
     pub async fn run(
         &self,
-        mut spec: CommandSpec,
+        spec: CommandSpec,
         cancel: CancellationToken,
     ) -> Result<CommandResult, ProcessError> {
+        let mut spec = self.prepare_spec(spec);
+        let capability = proxy_capability_for_program(&spec.program);
+        let configured_runtime = self
+            .proxy_runtime
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(runtime) = configured_runtime {
+            let proxy = runtime
+                .prepare(capability)
+                .await
+                .map_err(ProcessError::Proxy)?;
+            for (key, value) in proxy.vars {
+                spec.env.insert(key, value);
+            }
+        } else {
+            for (key, value) in &self.proxy.vars {
+                if is_proxy_env_key(key) {
+                    spec.env.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        self.runner.run(spec, cancel).await
+    }
+
+    /// 本地工具探测不依赖网络代理，避免代理离线时把已安装工具误判为不可用。
+    pub async fn run_direct(
+        &self,
+        spec: CommandSpec,
+        cancel: CancellationToken,
+    ) -> Result<CommandResult, ProcessError> {
+        self.runner.run(self.prepare_spec(spec), cancel).await
+    }
+
+    fn prepare_spec(&self, mut spec: CommandSpec) -> CommandSpec {
         // ProcessSupervisor clears inherited variables. Restore only the allowlisted values
         // package managers need to resolve the active user's global installation.
-        let mut path_entries = std::env::var("PATH")
-            .unwrap_or_default()
-            .split(':')
-            .filter(|entry| !entry.is_empty())
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
+        // Trusted system and package-manager locations take precedence. The inherited PATH is
+        // appended only for user-managed runtimes such as nvm/pyenv, so a writable directory
+        // cannot shadow Homebrew or system executables.
+        let mut path_entries = Vec::new();
         for required in [
             "/opt/homebrew/bin".to_owned(),
             "/usr/local/bin".to_owned(),
@@ -108,6 +173,15 @@ impl ExecutorContext {
         ] {
             if !path_entries.iter().any(|entry| entry == &required) {
                 path_entries.push(required);
+            }
+        }
+        for inherited in std::env::var("PATH")
+            .unwrap_or_default()
+            .split(':')
+            .filter(|entry| !entry.is_empty())
+        {
+            if !path_entries.iter().any(|entry| entry == inherited) {
+                path_entries.push(inherited.to_owned());
             }
         }
         let path = path_entries.join(":");
@@ -129,12 +203,20 @@ impl ExecutorContext {
                     .or_insert_with(|| value.to_string_lossy().into_owned());
             }
         }
-        for (key, value) in &self.proxy.vars {
-            if is_proxy_env_key(key) {
-                spec.env.insert(key.clone(), value.clone());
-            }
-        }
-        self.runner.run(spec, cancel).await
+        spec
+    }
+}
+
+fn proxy_capability_for_program(program: &str) -> ProxyCapability {
+    match std::path::Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program)
+    {
+        // These tools consume HTTP(S)_PROXY but do not consistently consume SOCKS5 URLs.
+        "brew" | "npm" | "python" | "python3" | "gem" => ProxyCapability::HttpOnly,
+        "rustup" => ProxyCapability::NativeSocks5,
+        _ => ProxyCapability::Unsupported,
     }
 }
 
@@ -247,7 +329,7 @@ pub trait EcosystemAdapter: Send + Sync + 'static {
         classify_command_error(result)
     }
 
-    /// Compatibility bridge for the Task 5 worker queue.
+    /// 兼容旧测试适配器；生产 worker 始终调用带上下文的路径。
     async fn run(
         &self,
         command: WorkerCommand,
@@ -281,21 +363,11 @@ pub trait EcosystemAdapter: Send + Sync + 'static {
             }
             WorkerCommand::Update(task) => self.execute(context, &task, cancel).await,
             WorkerCommand::Uninstall(task) => self.uninstall(context, &task, cancel).await,
+            WorkerCommand::Retry(_) => Err(TaskErrorKind::InvalidInput),
             WorkerCommand::RefreshDiskUsage(_) => Err(TaskErrorKind::Unknown),
             WorkerCommand::Shutdown => Ok(()),
         }
     }
-}
-
-pub async fn execute_worker_command(
-    adapter: &dyn EcosystemAdapter,
-    context: &ExecutorContext,
-    command: WorkerCommand,
-    cancel: CancellationToken,
-) -> Result<(), TaskErrorKind> {
-    adapter
-        .execute_worker_command(context, command, cancel)
-        .await
 }
 
 pub fn validate_name(name: &str) -> Result<(), TaskErrorKind> {
@@ -310,15 +382,14 @@ pub fn validate_name(name: &str) -> Result<(), TaskErrorKind> {
     {
         return Err(TaskErrorKind::InvalidInput);
     }
-    if name.contains('/') {
-        if name.starts_with('/')
+    if name.contains('/')
+        && (name.starts_with('/')
             || name.ends_with('/')
             || name
                 .split('/')
-                .any(|part| part.is_empty() || part == "." || part == "..")
-        {
-            return Err(TaskErrorKind::InvalidInput);
-        }
+                .any(|part| part.is_empty() || part == "." || part == ".."))
+    {
+        return Err(TaskErrorKind::InvalidInput);
     }
     Ok(())
 }
@@ -481,6 +552,13 @@ pub fn classify_process_error(error: &ProcessError) -> TaskErrorKind {
         // A supervisor timeout has no evidence that the cause was the network; do not
         // retry arbitrary long-running or hung local commands.
         ProcessError::ProcessTimeout => TaskErrorKind::CommandFailed,
+        ProcessError::Proxy(proxy) => match proxy {
+            crate::proxy::ProxyError::InvalidConfig
+            | crate::proxy::ProxyError::ProxyUnsupported => TaskErrorKind::InvalidInput,
+            crate::proxy::ProxyError::ProxyUnavailable | crate::proxy::ProxyError::BridgeFailed => {
+                TaskErrorKind::ProxyDisconnected
+            }
+        },
         ProcessError::Cancelled | ProcessError::Io(_) | ProcessError::Spawn(_) => {
             TaskErrorKind::CommandFailed
         }
@@ -505,10 +583,6 @@ pub fn command(program: &str, args: impl IntoIterator<Item = impl AsRef<str>>) -
         cwd: None,
         stdin: None,
     }
-}
-
-pub fn operation_is_update(task: &PackageTask) -> bool {
-    matches!(task.operation, Operation::Update)
 }
 
 #[cfg(test)]

@@ -18,38 +18,74 @@ pub fn run() -> tauri::Result<()> {
         crate::persistence::Database::open_default()
             .map_err(|e| tauri::Error::Setup((Box::new(e) as Box<dyn std::error::Error>).into()))?,
     ));
+    if let Some(database) = &database {
+        let _ = database.mark_running_tasks_interrupted();
+        let cutoff = chrono::Utc::now().timestamp() - 90 * 24 * 60 * 60;
+        let _ = database.cleanup_before(cutoff);
+    }
     let state = crate::commands::AppState::new(database);
     let scheduler_state = state.clone();
     let event_bus = state.event_bus.clone();
     tauri::Builder::default()
-        .plugin(tauri_plugin_autostart::Builder::new().build())
+        .plugin(
+            tauri_plugin_autostart::Builder::new()
+                .arg("--autostart")
+                .build(),
+        )
         .manage(state)
         .setup(move |app| {
             event_bus.attach_app(app.handle().clone());
-            crate::platform::tray::setup(&app.handle()).map_err(|error| {
+            crate::platform::tray::setup(app.handle()).map_err(|error| {
                 tauri::Error::Setup(
                     (Box::new(std::io::Error::other(error)) as Box<dyn std::error::Error>).into(),
                 )
             })?;
+            if !std::env::args().any(|argument| argument == "--autostart") {
+                if let Some(window) = app.get_webview_window("main") {
+                    window.show()?;
+                }
+            }
             let settings = scheduler_state.settings_snapshot();
-            let schedule =
-                crate::commands::schedule_from_settings(&settings).unwrap_or_else(|| {
-                    crate::scheduler::Schedule::daily("03:00").expect("valid default schedule")
+            let default_schedule =
+                crate::scheduler::Schedule::daily("03:00").expect("valid default schedule");
+            let scheduler = std::sync::Arc::new(crate::scheduler::Scheduler::new(default_schedule));
+            scheduler.set_schedule(crate::commands::schedule_from_settings(&settings));
+            if let Some(database) = &scheduler_state.database {
+                if let Ok(Some(raw)) = database.load_scheduler_state("completed_cycles") {
+                    match serde_json::from_str(&raw) {
+                        Ok(state) => scheduler.restore_state(state),
+                        Err(error) => scheduler_state
+                            .event_bus
+                            .log(format!("计划状态读取失败：{error}"), "scheduler"),
+                    }
+                }
+                let database = database.clone();
+                scheduler.set_state_recorder(move |state| {
+                    if let Ok(raw) = serde_json::to_string(state) {
+                        let _ = database.save_scheduler_state("completed_cycles", &raw);
+                    }
                 });
-            let scheduler = std::sync::Arc::new(crate::scheduler::Scheduler::new(schedule));
+            }
             let scheduled_state = scheduler_state.clone();
             scheduler.set_runner(move || {
-                if let Err(error) = crate::commands::submit_all_visible(&scheduled_state) {
-                    scheduled_state
-                        .event_bus
-                        .log(format!("计划更新失败：{error}"), "scheduler");
+                match crate::commands::submit_all_visible(&scheduled_state) {
+                    Ok(_) => true,
+                    Err(error) => {
+                        scheduled_state
+                            .event_bus
+                            .log(format!("计划更新等待重试：{error}"), "scheduler");
+                        false
+                    }
                 }
             });
-            crate::platform::macos::install_wake_listener(scheduler).map_err(|error| {
+            crate::platform::macos::install_wake_listener(scheduler.clone()).map_err(|error| {
                 tauri::Error::Setup(
                     (Box::new(std::io::Error::other(error)) as Box<dyn std::error::Error>).into(),
                 )
             })?;
+            // Keep the scheduler handle in shared application state so settings changes take
+            // effect without restarting the desktop process.
+            scheduler_state.set_scheduler(scheduler);
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -70,6 +106,10 @@ pub fn run() -> tauri::Result<()> {
             commands::save_settings,
             commands::set_login_item,
             commands::open_settings,
+            commands::refresh_disk_usage,
+            commands::cleanup_expired_logs,
+            commands::list_task_attempts,
+            commands::retry_task,
         ])
         .build(tauri::generate_context!())?
         .run(|app, event| {

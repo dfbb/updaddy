@@ -126,7 +126,7 @@ impl DiskUsageService {
         let Ok(signature) = path_signature(&install_paths.paths) else {
             return Ok(true);
         };
-        Ok(cached.map_or(true, |entry| {
+        Ok(cached.is_none_or(|entry| {
             entry.ecosystem != ecosystem_name(package.ecosystem)
                 || entry.package_id != package.id
                 || entry.installed_version != installed_version(package)
@@ -192,9 +192,9 @@ fn measure_paths_with_cancel(paths: &[PathBuf], cancel: &CancellationToken) -> R
             if entry.file_type().is_symlink() || !entry.file_type().is_file() {
                 continue;
             }
-            let metadata = entry.metadata().map_err(|error| {
-                std::io::Error::new(std::io::ErrorKind::Other, error.to_string())
-            })?;
+            let metadata = entry
+                .metadata()
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
             let identity = file_identity(entry.path(), &metadata);
             if seen_files.insert(identity) {
                 bytes = bytes.checked_add(metadata.len()).ok_or_else(|| {
@@ -357,10 +357,10 @@ fn resolve_tap(roots: &[PathBuf], name: &str) -> PackageInstallPaths {
 }
 
 fn resolve_gem(package: &PackageRecord, roots: &[PathBuf]) -> PackageInstallPaths {
-    let (name, version) = package.name.rsplit_once('@').map_or(
-        (package.name.as_str(), installed_version(package)),
-        |parts| parts,
-    );
+    let (name, version) = package
+        .name
+        .rsplit_once('@')
+        .unwrap_or((package.name.as_str(), installed_version(package)));
     if safe_relative(name).is_none() || safe_relative(version).is_none() {
         return PackageInstallPaths::unavailable(PathBuf::new());
     }
@@ -374,7 +374,7 @@ fn resolve_gem(package: &PackageRecord, roots: &[PathBuf]) -> PackageInstallPath
                     Some("specifications")
                 ) && root
                     .extension()
-                    .map_or(true, |extension| extension != "gemspec")
+                    .is_none_or(|extension| extension != "gemspec")
             })
             .map(|root| {
                 (

@@ -2,7 +2,7 @@ use crate::core::Ecosystem;
 use tauri::{
     menu::{MenuBuilder, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
-    AppHandle, Manager,
+    AppHandle, Emitter, Manager,
 };
 
 /// 创建状态栏菜单。菜单动作通过 commands 复用同一 supervisor，避免重复业务逻辑。
@@ -15,10 +15,17 @@ pub fn setup(app: &AppHandle) -> Result<(), String> {
         tray = tray.icon(icon.clone()).icon_as_template(true);
     }
     tray.on_menu_event(|app, event| match event.id().as_ref() {
-        "open" | "count" => {
+        "open" => {
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.show();
                 let _ = w.set_focus();
+            }
+        }
+        "count" => {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.show();
+                let _ = w.set_focus();
+                let _ = w.emit("open-overview", ());
             }
         }
         "settings" => {
@@ -41,6 +48,11 @@ pub fn setup(app: &AppHandle) -> Result<(), String> {
 
 fn build_menu(app: &AppHandle) -> Result<tauri::menu::Menu<tauri::Wry>, String> {
     let state = app.state::<crate::commands::AppState>();
+    let chinese = state
+        .settings_snapshot()
+        .locale
+        .to_ascii_lowercase()
+        .starts_with("zh");
     let snapshots = state
         .database
         .as_ref()
@@ -66,27 +78,62 @@ fn build_menu(app: &AppHandle) -> Result<tauri::menu::Menu<tauri::Wry>, String> 
         false
     };
     let label = if checking {
-        "正在检查更新…".to_owned()
+        if chinese {
+            "正在检查更新…"
+        } else {
+            "Checking for updates…"
+        }
+        .to_owned()
     } else if total == 0 {
-        "已是最新".to_owned()
+        if chinese {
+            "已是最新"
+        } else {
+            "Up to date"
+        }
+        .to_owned()
     } else {
-        format!("可更新：{total}")
+        if chinese {
+            format!("可更新：{total}")
+        } else {
+            format!("Updates available: {total}")
+        }
     };
     let count =
         MenuItem::with_id(app, "count", label, true, None::<&str>).map_err(|e| e.to_string())?;
     let update = MenuItem::with_id(
         app,
         "update",
-        "一键更新",
+        if chinese {
+            "一键更新"
+        } else {
+            "Update all"
+        },
         state.supervisor.active_task_count() == 0,
         None::<&str>,
     )
     .map_err(|e| e.to_string())?;
-    let open = MenuItem::with_id(app, "open", "打开主窗口", true, None::<&str>)
+    let open = MenuItem::with_id(
+        app,
+        "open",
+        if chinese {
+            "打开主窗口"
+        } else {
+            "Open main window"
+        },
+        true,
+        None::<&str>,
+    )
+    .map_err(|e| e.to_string())?;
+    let settings = MenuItem::with_id(
+        app,
+        "settings",
+        if chinese { "设置" } else { "Settings" },
+        true,
+        None::<&str>,
+    )
+    .map_err(|e| e.to_string())?;
+    let quit = PredefinedMenuItem::quit(app, Some(if chinese { "退出" } else { "Quit" }))
         .map_err(|e| e.to_string())?;
-    let settings = MenuItem::with_id(app, "settings", "设置", true, None::<&str>)
-        .map_err(|e| e.to_string())?;
-    let quit = PredefinedMenuItem::quit(app, Some("退出")).map_err(|e| e.to_string())?;
     MenuBuilder::new(app)
         .items(&[&count, &update, &open, &settings, &quit])
         .build()

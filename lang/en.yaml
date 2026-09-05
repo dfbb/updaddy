@@ -1,4 +1,14 @@
-overview: Overview
+app:
+  tagline: Global package updates, in one place
+overview:
+  label: Overview
+  eyebrow: Workspace overview
+  title: Keep your tools up to date
+  description: Review global packages across every enabled ecosystem.
+  updates_available: Updates available
+  one_update: update available
+  many_updates: "{count} updates available"
+  installed: installed
 ecosystems:
   homebrew: Homebrew
   npm: npm
@@ -11,7 +21,45 @@ task:
   succeeded: Succeeded
   failed: Failed
   cancelled: Cancelled
+  interrupted: Interrupted
   cancel: Cancel
+  progress_label: Task progress
+  ecosystem_scan: ecosystem scan
+worker:
+  idle: Ready
+operations:
+  scan: Scanning
+  update: Updating
+  uninstall: Uninstalling
+  measure_disk: Measuring disk usage
+package:
+  table_caption: Installed packages
+  name: Name
+  current_version: Current version
+  target_version: Target version
+  disk_usage: Disk usage
+  disk_unavailable: Unavailable
+  disk_measuring: Calculating…
+  unknown_version: Unknown
+  pending_target: Pending
+  status: Status
+  actions: Actions
+  ecosystem: Ecosystem
+  version: Version
+  resource_type: Resource type
+  update_available: Update available
+  up_to_date: Up to date
+  measuring: Calculating disk usage
+  ready: Ready
+  unavailable: Unavailable
+resource:
+  formula: Formula
+  cask: Cask
+  tap: Tap
+  package: Package
+  toolchain: Toolchain
+  component: Component
+  target: Target
 buttons:
   update_all: Update all
   open: Open main window
@@ -19,12 +67,87 @@ buttons:
   quit: Quit
   update: Update
   uninstall: Uninstall
+  cancel: Cancel
+  scan: Scan
+navigation:
+  label: Main navigation
+  ecosystems: Ecosystems
+  history: History and logs
+  operation_in_progress: An operation is in progress
 settings:
   title: Settings
+  description: Configure appearance, proxy, scheduling, ecosystems, and logs.
+  save: Save settings
+  saved: Settings saved
+  tabs_label: Settings sections
+  general_tab: General
+  logs_tab: Logs
+  appearance: Appearance
   theme: Theme
+  theme_system: Follow system
+  theme_light: Light
+  theme_dark: Dark
   locale: Language
   proxy: Proxy
+  use_proxy: Use SOCKS5 proxy
+  proxy_address: SOCKS5 address
+  proxy_username: Username (optional)
+  proxy_password: Password (optional)
+  proxy_warning: Credentials are stored in the local application database and never shown in logs.
   schedule: Schedule
+  schedule_enabled: Enable scheduled updates
+  schedule_type: Frequency
+  daily: Daily
+  weekly: Weekly
+  weekday: Weekday
+  time: Time
+  schedule_disabled: Scheduled updates are disabled.
+  days:
+    monday: Monday
+    tuesday: Tuesday
+    wednesday: Wednesday
+    thursday: Thursday
+    friday: Friday
+    saturday: Saturday
+    sunday: Sunday
+  ecosystems: Ecosystems
+  login_item: Start at login
+  logs_description: Detailed command output is disabled by default and all retained records are removed after 90 days.
+  log_level: Log level
+  retain_output: Retain complete command output
+  retention_notice: Logs and history are retained for 90 days.
+  cleanup_logs: Clean expired logs now
+  cleaned_count: "Removed {count} expired records."
+  coming_soon: Settings are coming soon
+  coming_soon_description: Configuration controls will appear here.
 logs:
   title: Logs
-confirm_uninstall: Uninstall this package?
+  empty: No logs yet
+confirm_uninstall:
+  title: Uninstall this package?
+  description: This action removes the package from the selected global environment.
+empty:
+  no_packages: No packages found
+  no_packages_description: Scan this ecosystem to discover globally installed packages.
+  no_ecosystems: No ecosystems available
+  no_ecosystems_description: Enable an ecosystem or install its package manager to get started.
+history:
+  title: History and logs
+  description: Review completed and interrupted package operations.
+  filter_ecosystem: Ecosystem
+  filter_status: Status
+  filter_operation: Operation
+  filter_period: Time range
+  all: All
+  period_all: All time
+  period_day: Last 24 hours
+  period_week: Last 7 days
+  period_month: Last 30 days
+  batches: Batches
+  batch_summary: "{total} tasks · {succeeded} succeeded · {failed} failed · {cancelled} cancelled"
+  attempts: Attempts
+  no_attempts: No recorded attempts.
+  no_tasks: No tasks match the selected filters.
+  retry: Retry
+  coming_soon: History is coming soon
+  coming_soon_description: Completed scans and package operations will appear here.

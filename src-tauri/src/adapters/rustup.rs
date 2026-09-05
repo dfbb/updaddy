@@ -22,8 +22,27 @@ impl RustupAdapter {
 
     pub async fn discover_install_paths(
         &self,
-        _context: &ExecutorContext,
+        context: &ExecutorContext,
     ) -> Result<Vec<PathBuf>, TaskErrorKind> {
+        self.discover_install_paths_with_cancel(context, CancellationToken::new())
+            .await
+    }
+
+    async fn discover_install_paths_with_cancel(
+        &self,
+        context: &ExecutorContext,
+        cancel: CancellationToken,
+    ) -> Result<Vec<PathBuf>, TaskErrorKind> {
+        let result = context
+            .run(command("rustup", ["show", "home"]), cancel)
+            .await
+            .map_err(|error| classify_process_error(&error))?;
+        if result.status.success() {
+            let root = PathBuf::from(result.stdout.trim());
+            if !root.as_os_str().is_empty() {
+                return Ok(vec![root.join("toolchains")]);
+            }
+        }
         Ok(<Self as EcosystemAdapter>::install_paths(self))
     }
 }
@@ -43,7 +62,7 @@ impl EcosystemAdapter for RustupAdapter {
     }
     async fn detect(&self, context: &ExecutorContext) -> Result<bool, TaskErrorKind> {
         match context
-            .run(command("rustup", ["--version"]), CancellationToken::new())
+            .run_direct(command("rustup", ["--version"]), CancellationToken::new())
             .await
         {
             Ok(result) if result.status.success() => Ok(true),
@@ -108,6 +127,15 @@ impl EcosystemAdapter for RustupAdapter {
             ));
         }
         Ok(records)
+    }
+
+    async fn resolve_install_paths(
+        &self,
+        context: &ExecutorContext,
+        cancel: CancellationToken,
+    ) -> Result<Vec<PathBuf>, TaskErrorKind> {
+        self.discover_install_paths_with_cancel(context, cancel)
+            .await
     }
     fn plan(&self, task: &PackageTask) -> Result<CommandSpec, TaskErrorKind> {
         if task.ecosystem != Ecosystem::Rustup {

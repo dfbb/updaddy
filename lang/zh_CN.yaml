@@ -1,4 +1,14 @@
-overview: 概览
+app:
+  tagline: 在一个地方更新全局软件包
+overview:
+  label: 概览
+  eyebrow: 工作区概览
+  title: 保持开发工具最新
+  description: 查看所有已启用生态中的全局软件包。
+  updates_available: 可更新
+  one_update: 项可更新
+  many_updates: "{count} 项可更新"
+  installed: 已安装
 ecosystems:
   homebrew: Homebrew
   npm: npm
@@ -11,7 +21,45 @@ task:
   succeeded: 已完成
   failed: 失败
   cancelled: 已取消
+  interrupted: 已中断
   cancel: 取消
+  progress_label: 任务进度
+  ecosystem_scan: 生态扫描
+worker:
+  idle: 就绪
+operations:
+  scan: 扫描中
+  update: 更新中
+  uninstall: 卸载中
+  measure_disk: 计算磁盘占用
+package:
+  table_caption: 已安装软件包
+  name: 名称
+  current_version: 当前版本
+  target_version: 目标版本
+  disk_usage: 磁盘占用
+  disk_unavailable: 不可用
+  disk_measuring: 计算中…
+  unknown_version: 未知
+  pending_target: 等待中
+  status: 状态
+  actions: 操作
+  ecosystem: 生态
+  version: 版本
+  resource_type: 资源类型
+  update_available: 有可用更新
+  up_to_date: 已是最新
+  measuring: 正在计算磁盘占用
+  ready: 就绪
+  unavailable: 不可用
+resource:
+  formula: Formula
+  cask: Cask
+  tap: Tap
+  package: 软件包
+  toolchain: 工具链
+  component: 组件
+  target: 目标平台
 buttons:
   update_all: 全部更新
   open: 打开主窗口
@@ -19,12 +67,87 @@ buttons:
   quit: 退出
   update: 更新
   uninstall: 卸载
+  cancel: 取消
+  scan: 扫描
+navigation:
+  label: 主导航
+  ecosystems: 生态
+  history: 历史与日志
+  operation_in_progress: 任务执行中
 settings:
   title: 设置
+  description: 配置界面、代理、计划、生态显示和日志。
+  save: 保存设置
+  saved: 设置已保存
+  tabs_label: 设置分区
+  general_tab: 常规
+  logs_tab: 日志
+  appearance: 外观
   theme: 主题
+  theme_system: 跟随系统
+  theme_light: 浅色
+  theme_dark: 深色
   locale: 语言
   proxy: 代理
+  use_proxy: 使用 SOCKS5 代理
+  proxy_address: SOCKS5 地址
+  proxy_username: 用户名（可选）
+  proxy_password: 密码（可选）
+  proxy_warning: 凭据保存在本地应用数据库中，不会写入日志。
   schedule: 更新计划
+  schedule_enabled: 启用定时更新
+  schedule_type: 周期
+  daily: 每日
+  weekly: 每周
+  weekday: 星期
+  time: 时间
+  schedule_disabled: 定时更新已关闭。
+  days:
+    monday: 星期一
+    tuesday: 星期二
+    wednesday: 星期三
+    thursday: 星期四
+    friday: 星期五
+    saturday: 星期六
+    sunday: 星期日
+  ecosystems: 生态
+  login_item: 开机自动运行
+  logs_description: 完整命令输出默认关闭，所有日志和历史保留 90 天。
+  log_level: 日志级别
+  retain_output: 保留完整命令输出
+  retention_notice: 日志和历史保留 90 天。
+  cleanup_logs: 立即清理过期日志
+  cleaned_count: 已清理 {count} 条过期记录。
+  coming_soon: 设置功能即将提供
+  coming_soon_description: 配置选项将在这里显示。
 logs:
   title: 日志
-confirm_uninstall: 确定卸载此软件包？
+  empty: 暂无日志
+confirm_uninstall:
+  title: 确定卸载此软件包？
+  description: 此操作会从选定的全局环境中删除该软件包。
+empty:
+  no_packages: 未找到软件包
+  no_packages_description: 扫描此生态以发现全局安装的软件包。
+  no_ecosystems: 没有可用的生态
+  no_ecosystems_description: 启用一个生态或安装对应的软件包管理器后即可开始。
+history:
+  title: 历史与日志
+  description: 查看已完成、中断和失败的软件包操作。
+  filter_ecosystem: 生态
+  filter_status: 状态
+  filter_operation: 操作类型
+  filter_period: 时间范围
+  all: 全部
+  period_all: 全部时间
+  period_day: 最近 24 小时
+  period_week: 最近 7 天
+  period_month: 最近 30 天
+  batches: 批次
+  batch_summary: "共 {total} 项 · 成功 {succeeded} · 失败 {failed} · 取消 {cancelled}"
+  attempts: 尝试记录
+  no_attempts: 暂无尝试记录。
+  no_tasks: 没有符合筛选条件的任务。
+  retry: 重试
+  coming_soon: 历史功能即将提供
+  coming_soon_description: 已完成的扫描和软件包操作将在这里显示。

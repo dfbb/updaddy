@@ -1,4 +1,5 @@
 use rusqlite::{params, OptionalExtension};
+use serde::{Deserialize, Serialize};
 use serde_json;
 use uuid::Uuid;
 
@@ -20,7 +21,7 @@ pub struct DiskUsageCacheEntry {
     pub scanned_at: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskAttempt {
     pub id: i64,
     pub attempt: u32,
@@ -71,21 +72,45 @@ impl Database {
 
     pub fn load_setting(&self, key: &str) -> Result<Option<String>> {
         let conn = self.conn.lock().unwrap();
-        conn.query_row("SELECT value FROM settings WHERE key=?1", params![key], |r| r.get(0)).optional().map_err(Into::into)
+        conn.query_row(
+            "SELECT value FROM settings WHERE key=?1",
+            params![key],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     pub fn list_tasks(&self) -> Result<Vec<PackageTask>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT task_id,ecosystem,name,operation,status,error FROM package_tasks ORDER BY rowid DESC")?;
         let rows = stmt.query_map([], |row| {
-            let task_id = row.get::<_, String>(0)?.parse::<Uuid>().map_err(|_| rusqlite::Error::InvalidQuery)?;
-            let ecosystem = parse_enum(&row.get::<_, String>(1)?, "ecosystem").map_err(|_| rusqlite::Error::InvalidQuery)?;
-            let operation = parse_enum(&row.get::<_, String>(3)?, "operation").map_err(|_| rusqlite::Error::InvalidQuery)?;
-            let status = parse_enum(&row.get::<_, String>(4)?, "task status").map_err(|_| rusqlite::Error::InvalidQuery)?;
-            let error = row.get::<_, Option<String>>(5)?.map(|v| parse_enum(&v, "task error")).transpose().map_err(|_| rusqlite::Error::InvalidQuery)?;
-            Ok(PackageTask { task_id, ecosystem, name: row.get(2)?, operation, status, error })
+            let task_id = row
+                .get::<_, String>(0)?
+                .parse::<Uuid>()
+                .map_err(|_| rusqlite::Error::InvalidQuery)?;
+            let ecosystem = parse_enum(&row.get::<_, String>(1)?, "ecosystem")
+                .map_err(|_| rusqlite::Error::InvalidQuery)?;
+            let operation = parse_enum(&row.get::<_, String>(3)?, "operation")
+                .map_err(|_| rusqlite::Error::InvalidQuery)?;
+            let status = parse_enum(&row.get::<_, String>(4)?, "task status")
+                .map_err(|_| rusqlite::Error::InvalidQuery)?;
+            let error = row
+                .get::<_, Option<String>>(5)?
+                .map(|v| parse_enum(&v, "task error"))
+                .transpose()
+                .map_err(|_| rusqlite::Error::InvalidQuery)?;
+            Ok(PackageTask {
+                task_id,
+                ecosystem,
+                name: row.get(2)?,
+                operation,
+                status,
+                error,
+            })
         })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
     pub fn list_snapshots(&self) -> Result<Vec<PackageRecord>> {
         let conn = self.conn.lock().unwrap();
@@ -402,6 +427,30 @@ impl Database {
         }))
     }
 
+    pub fn list_batches(&self) -> Result<Vec<OperationBatch>> {
+        let batch_ids = {
+            let conn = self.conn.lock().unwrap();
+            let mut statement = conn.prepare(
+                "SELECT batch_id FROM operation_batches ORDER BY created_at DESC, rowid DESC",
+            )?;
+            let ids = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            ids
+        };
+        batch_ids
+            .into_iter()
+            .map(|batch_id| {
+                let batch_id = batch_id.parse::<Uuid>().map_err(|_| {
+                    PersistenceError::InvalidValue("operation batch has an invalid id".into())
+                })?;
+                self.load_batch(batch_id)?.ok_or_else(|| {
+                    PersistenceError::InvalidValue("operation batch disappeared".into())
+                })
+            })
+            .collect()
+    }
+
     pub fn update_task(
         &self,
         task_id: Uuid,
@@ -526,5 +575,33 @@ mod tests {
         let attempts = db.list_task_attempts(task_id).unwrap();
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].finished_at, Some(20));
+    }
+
+    #[test]
+    fn batches_are_listed_newest_first_with_their_tasks() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(directory.path().join("history.sqlite")).unwrap();
+        let first = OperationBatch {
+            batch_id: Uuid::new_v4(),
+            ecosystem: Ecosystem::Npm,
+            tasks: vec![PackageTask::new(Ecosystem::Npm, "first", Operation::Scan)],
+            created_at: 1,
+        };
+        let second = OperationBatch {
+            batch_id: Uuid::new_v4(),
+            ecosystem: Ecosystem::Gem,
+            tasks: vec![PackageTask::new(
+                Ecosystem::Gem,
+                "second",
+                Operation::Update,
+            )],
+            created_at: 2,
+        };
+        database.create_batch(&first).unwrap();
+        database.create_batch(&second).unwrap();
+
+        let batches = database.list_batches().unwrap();
+        assert_eq!(batches[0], second);
+        assert_eq!(batches[1], first);
     }
 }

@@ -38,7 +38,7 @@ impl EcosystemAdapter for NpmAdapter {
 
     async fn detect(&self, context: &ExecutorContext) -> Result<bool, TaskErrorKind> {
         match context
-            .run(command("npm", ["--version"]), CancellationToken::new())
+            .run_direct(command("npm", ["--version"]), CancellationToken::new())
             .await
         {
             Ok(result) if result.status.success() => Ok(true),

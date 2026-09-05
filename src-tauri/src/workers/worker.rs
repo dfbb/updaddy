@@ -1,3 +1,5 @@
+#![allow(clippy::items_after_test_module)]
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,20 +15,11 @@ use crate::core::{
 };
 use crate::disk_usage::{CacheStore, DiskUsageError, DiskUsageService, PackageInstallPaths};
 use crate::persistence::Database;
-use crate::proxy::ProxyError;
 
 use super::messages::WorkerCommand;
 use super::{WorkerEvent, WorkerEventSink};
 
 pub use crate::adapters::EcosystemAdapter;
-
-/// 将代理运行时错误映射到现有 worker 重试语义；配置错误保持不可重试。
-pub(crate) fn classify_proxy_error(error: ProxyError) -> TaskErrorKind {
-    match error {
-        ProxyError::InvalidConfig | ProxyError::ProxyUnsupported => TaskErrorKind::InvalidInput,
-        ProxyError::ProxyUnavailable | ProxyError::BridgeFailed => TaskErrorKind::ProxyDisconnected,
-    }
-}
 
 /// Adapter used when a worker has no implementation yet.
 pub struct NoopAdapter;
@@ -175,6 +168,7 @@ async fn scan_with_retries(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_command(
     ecosystem: Ecosystem,
     task_id: Uuid,
@@ -272,8 +266,12 @@ pub(crate) async fn run_command(
     *sequence += 1;
     emit_state(ecosystem, "idle", *sequence, &sink);
     *sequence += 1;
+    let batch_id = database
+        .as_ref()
+        .and_then(|database| database.batch_id_for_task(task_id).ok().flatten())
+        .unwrap_or(task_id);
     sink(WorkerEvent::BatchSummary {
-        batch_id: task_id,
+        batch_id,
         ecosystem,
         sequence: *sequence,
         total: 1,
@@ -294,6 +292,7 @@ pub(crate) fn command_task(
         WorkerCommand::RefreshDiskUsage(package) => (package.name.clone(), Operation::MeasureDisk),
         WorkerCommand::Update(task) => (task.name.clone(), Operation::Update),
         WorkerCommand::Uninstall(task) => (task.name.clone(), Operation::Uninstall),
+        WorkerCommand::Retry(task) => (task.name.clone(), task.operation),
         WorkerCommand::Shutdown => ("*".to_owned(), Operation::Scan),
     };
     PackageTask {
@@ -318,6 +317,49 @@ async fn execute_command(
     sequence: &mut u64,
     sink: &WorkerEventSink,
 ) -> Result<(), TaskErrorKind> {
+    let command = if let WorkerCommand::Retry(task) = command {
+        if task.ecosystem != ecosystem
+            || !matches!(task.operation, Operation::Update | Operation::Uninstall)
+        {
+            return Err(TaskErrorKind::InvalidInput);
+        }
+        let packages = scan_with_retries(
+            adapter,
+            executor,
+            ecosystem,
+            cancel.clone(),
+            database,
+            task_id,
+        )
+        .await?;
+        persist_and_measure_scan(
+            task_id,
+            packages,
+            adapter,
+            executor,
+            cancel.clone(),
+            database,
+            sequence,
+            sink,
+        )
+        .await?;
+        let current = database
+            .ok_or(TaskErrorKind::Unknown)?
+            .find_snapshot(ecosystem, &task.name)
+            .map_err(|_| TaskErrorKind::Unknown)?
+            .ok_or(TaskErrorKind::InvalidInput)?;
+        if task.operation == Operation::Update && !current.update_available {
+            return Err(TaskErrorKind::InvalidInput);
+        }
+        if task.operation == Operation::Update {
+            WorkerCommand::Update(task)
+        } else {
+            WorkerCommand::Uninstall(task)
+        }
+    } else {
+        command
+    };
+
     match command {
         WorkerCommand::Scan(requested) => {
             if requested != ecosystem {
@@ -368,17 +410,23 @@ async fn execute_command(
                                 .rsplit_once('@')
                                 .map_or(package.name.as_str(), |(name, _)| name)
                                 .to_owned();
-                            let old_id = package.id.clone();
-                            package.name = format!("{name}@{target}");
-                            package.id = format!(
-                                "{:?}:{:?}:{}",
-                                package.ecosystem, package.resource_kind, package.name
-                            );
-                            database
-                                .delete_snapshot_and_disk_usage(ecosystem, &old_id)
-                                .map_err(|_| TaskErrorKind::Unknown)?;
-                            package.current_version = Some(target);
+                            // `gem update` installs the new version without removing the old
+                            // version. Keep the old snapshot/cache and measure only the new gem.
+                            package.target_version = None;
                             package.update_available = false;
+                            database
+                                .save_snapshot(&package)
+                                .map_err(|_| TaskErrorKind::Unknown)?;
+                            let mut installed = package.clone();
+                            installed.name = format!("{name}@{target}");
+                            installed.id = format!(
+                                "{:?}:{:?}:{}",
+                                installed.ecosystem, installed.resource_kind, installed.name
+                            );
+                            installed.current_version = Some(target);
+                            installed.disk_usage = None;
+                            affected_packages.push(installed);
+                            continue;
                         } else {
                             package.current_version = Some(target);
                             package.update_available = false;
@@ -478,6 +526,7 @@ async fn execute_command(
             }
             Ok(())
         }
+        WorkerCommand::Retry(_) => unreachable!("retry command is resolved by the preflight scan"),
         WorkerCommand::Shutdown => Ok(()),
     }
 }

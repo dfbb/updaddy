@@ -35,7 +35,7 @@ impl EcosystemAdapter for GemAdapter {
     }
     async fn detect(&self, context: &ExecutorContext) -> Result<bool, TaskErrorKind> {
         match context
-            .run(command("gem", ["--version"]), CancellationToken::new())
+            .run_direct(command("gem", ["--version"]), CancellationToken::new())
             .await
         {
             Ok(result) if result.status.success() => Ok(true),
@@ -72,12 +72,12 @@ impl EcosystemAdapter for GemAdapter {
             .collect::<Vec<_>>();
         if !outdated.status.success() {
             let classified = self.classify_error(&outdated);
-            if classified.is_retryable()
+            if parsed_updates.is_empty()
+                || classified.is_retryable()
                 || matches!(
                     classified,
                     TaskErrorKind::PermissionDenied | TaskErrorKind::InvalidInput
                 )
-                || parsed_updates.is_empty()
             {
                 return Err(classified);
             }
@@ -99,10 +99,7 @@ impl EcosystemAdapter for GemAdapter {
                 .filter(|version| !version.is_empty());
             for version in versions {
                 let target = updates.get(name).and_then(|(expected, target)| {
-                    if expected
-                        .as_deref()
-                        .map_or(true, |current| current == version)
-                    {
+                    if expected.as_deref().is_none_or(|current| current == version) {
                         Some(target.clone())
                     } else {
                         None
@@ -211,6 +208,20 @@ fn parse_outdated_line(line: &str) -> Option<(String, Option<String>, String)> {
         }
         let current = (!current.is_empty()).then(|| current.to_owned());
         return Some((name.to_owned(), current, target.to_owned()));
+    }
+    // RubyGems also emits `name (current, newest)` on some versions.
+    if let Some((current, target)) = body.split_once(',') {
+        let current = current
+            .trim()
+            .strip_prefix("current ")
+            .or_else(|| current.trim().strip_prefix("installed "))
+            .unwrap_or(current.trim());
+        let target = target
+            .trim()
+            .strip_prefix("newest ")
+            .unwrap_or(target.trim());
+        return (!name.is_empty() && !current.is_empty() && !target.is_empty())
+            .then(|| (name.to_owned(), Some(current.to_owned()), target.to_owned()));
     }
     let newest = body.strip_prefix("newest ")?;
     let target = newest.split(',').next().map(str::trim).unwrap_or_default();

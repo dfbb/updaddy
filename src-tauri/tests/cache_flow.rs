@@ -412,16 +412,18 @@ impl CommandRunner for BrewUpdateRunner {
         _cancel: CancellationToken,
     ) -> Result<CommandResult, ProcessError> {
         assert_eq!(spec.program, "brew");
-        assert_eq!(
-            spec.args.iter().map(String::as_str).collect::<Vec<_>>(),
-            ["update"]
-        );
+        let args = spec.args.iter().map(String::as_str).collect::<Vec<_>>();
+        let stdout = match args.as_slice() {
+            ["--prefix"] => "/opt/homebrew\n",
+            ["update"] => "Updated 1 tap (acme/one).\n",
+            _ => panic!("unexpected brew command: {args:?}"),
+        };
         Ok(CommandResult {
             status: std::process::Command::new("sh")
                 .args(["-c", "exit 0"])
                 .status()
                 .unwrap(),
-            stdout: "Updated 1 tap (acme/one).\n".into(),
+            stdout: stdout.into(),
             stderr: String::new(),
             duration: Duration::ZERO,
         })

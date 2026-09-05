@@ -50,8 +50,31 @@ impl HomebrewAdapter {
 
     pub async fn discover_install_paths(
         &self,
-        _context: &ExecutorContext,
+        context: &ExecutorContext,
     ) -> Result<Vec<PathBuf>, TaskErrorKind> {
+        self.discover_install_paths_with_cancel(context, CancellationToken::new())
+            .await
+    }
+
+    async fn discover_install_paths_with_cancel(
+        &self,
+        context: &ExecutorContext,
+        cancel: CancellationToken,
+    ) -> Result<Vec<PathBuf>, TaskErrorKind> {
+        let result = context
+            .run(command("brew", ["--prefix"]), cancel)
+            .await
+            .map_err(|error| classify_process_error(&error))?;
+        if result.status.success() {
+            let prefix = PathBuf::from(result.stdout.trim());
+            if !prefix.as_os_str().is_empty() {
+                return Ok(vec![
+                    prefix.join("Cellar"),
+                    prefix.join("Caskroom"),
+                    prefix.join("Library/Taps"),
+                ]);
+            }
+        }
         Ok(<Self as EcosystemAdapter>::install_paths(self))
     }
 }
@@ -73,7 +96,7 @@ impl EcosystemAdapter for HomebrewAdapter {
 
     async fn detect(&self, context: &ExecutorContext) -> Result<bool, TaskErrorKind> {
         match context
-            .run(command("brew", ["--version"]), CancellationToken::new())
+            .run_direct(command("brew", ["--version"]), CancellationToken::new())
             .await
         {
             Ok(result) if result.status.success() => Ok(true),
@@ -224,7 +247,11 @@ impl EcosystemAdapter for HomebrewAdapter {
         {
             return Err(TaskErrorKind::CommandFailed);
         }
-        Ok(changed)
+        if changed.is_empty() {
+            Ok(vec![task.name.clone()])
+        } else {
+            Ok(changed)
+        }
     }
 
     fn install_paths(&self) -> Vec<PathBuf> {
@@ -237,6 +264,15 @@ impl EcosystemAdapter for HomebrewAdapter {
             PathBuf::from("/opt/homebrew/Library/Taps"),
             PathBuf::from("/usr/local/Homebrew/Library/Taps"),
         ]
+    }
+
+    async fn resolve_install_paths(
+        &self,
+        context: &ExecutorContext,
+        cancel: CancellationToken,
+    ) -> Result<Vec<PathBuf>, TaskErrorKind> {
+        self.discover_install_paths_with_cancel(context, cancel)
+            .await
     }
 
     async fn resolve_package_install_paths(

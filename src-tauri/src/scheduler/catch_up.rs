@@ -1,9 +1,12 @@
 use std::collections::BTreeSet;
 
+use serde::{Deserialize, Serialize};
+
 use super::schedule::Schedule;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SchedulerState {
+    #[serde(default)]
     completed_cycles: BTreeSet<String>,
 }
 

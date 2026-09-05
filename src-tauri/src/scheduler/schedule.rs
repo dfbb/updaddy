@@ -1,7 +1,7 @@
 use chrono::{Datelike, Local, NaiveDate, NaiveTime, TimeZone, Weekday};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
+    Arc, Condvar, Mutex,
 };
 use std::thread;
 use std::time::Duration;
@@ -147,48 +147,97 @@ impl EnabledEcosystems {
 
 #[derive(Clone)]
 pub struct Scheduler {
-    pub schedule: Schedule,
+    schedule: Arc<Mutex<Option<Schedule>>>,
     config_version: String,
     started: Arc<AtomicBool>,
     state: Arc<Mutex<SchedulerState>>,
-    runner: Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>,
+    runner: Arc<Mutex<Option<SchedulerRunner>>>,
+    state_recorder: Arc<Mutex<Option<StateRecorder>>>,
+    wake: Arc<(Mutex<u64>, Condvar)>,
 }
+
+type SchedulerRunner = Arc<dyn Fn() -> bool + Send + Sync>;
+type StateRecorder = Arc<dyn Fn(&SchedulerState) + Send + Sync>;
 
 impl Scheduler {
     pub fn new(schedule: Schedule) -> Self {
         Self {
-            schedule,
+            schedule: Arc::new(Mutex::new(Some(schedule))),
             config_version: "v1".into(),
             started: Arc::new(AtomicBool::new(false)),
             state: Arc::new(Mutex::new(SchedulerState::default())),
             runner: Arc::new(Mutex::new(None)),
+            state_recorder: Arc::new(Mutex::new(None)),
+            wake: Arc::new((Mutex::new(0), Condvar::new())),
         }
     }
     pub fn with_config_version(schedule: Schedule, version: impl Into<String>) -> Self {
         Self {
-            schedule,
+            schedule: Arc::new(Mutex::new(Some(schedule))),
             config_version: version.into(),
             started: Arc::new(AtomicBool::new(false)),
             state: Arc::new(Mutex::new(SchedulerState::default())),
             runner: Arc::new(Mutex::new(None)),
+            state_recorder: Arc::new(Mutex::new(None)),
+            wake: Arc::new((Mutex::new(0), Condvar::new())),
         }
     }
-    pub fn set_runner(&self, runner: impl Fn() + Send + Sync + 'static) {
+    pub fn set_runner(&self, runner: impl Fn() -> bool + Send + Sync + 'static) {
         *self.runner.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(runner));
     }
+
+    pub fn restore_state(&self, state: SchedulerState) {
+        *self.state.lock().unwrap_or_else(|p| p.into_inner()) = state;
+    }
+
+    pub fn set_state_recorder(&self, recorder: impl Fn(&SchedulerState) + Send + Sync + 'static) {
+        *self
+            .state_recorder
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(recorder));
+    }
+
+    pub fn set_schedule(&self, schedule: Option<Schedule>) {
+        *self
+            .schedule
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = schedule;
+        self.wake.1.notify_all();
+    }
+
+    fn schedule_snapshot(&self) -> Option<Schedule> {
+        self.schedule
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     pub fn trigger(&self) {
+        let Some(schedule) = self.schedule_snapshot() else {
+            return;
+        };
         let now = chrono::Utc::now().timestamp();
         let cycle = self.cycle_id(now);
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        if CatchUp::should_run(&cycle, now, &state, &self.schedule) {
-            *state = state.record_cycle(cycle);
+        if CatchUp::should_run(&cycle, now, &state, &schedule) {
             if let Some(run) = self
                 .runner
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .clone()
             {
-                run();
+                // 忙碌时保留本周期，下一次唤醒后重试，避免手动批次吞掉计划任务。
+                if run() {
+                    *state = state.record_cycle(cycle);
+                    if let Some(record) = self
+                        .state_recorder
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .clone()
+                    {
+                        record(&state);
+                    }
+                }
             }
         }
     }
@@ -196,42 +245,76 @@ impl Scheduler {
         if self.started.swap(true, Ordering::AcqRel) {
             return;
         }
-        let schedule = self.schedule.clone();
         let started = self.started.clone();
         let this = self.clone();
         thread::spawn(move || {
             this.trigger();
             while started.load(Ordering::Acquire) {
                 let now = chrono::Utc::now().timestamp();
-                let wait = schedule.next_due(now).saturating_sub(now).max(1) as u64;
-                thread::sleep(Duration::from_secs(wait.min(60)));
+                let wait = this
+                    .schedule_snapshot()
+                    .map(|schedule| schedule.next_due(now).saturating_sub(now).max(1) as u64)
+                    .unwrap_or(60);
+                let (generation, wake) = &*this.wake;
+                let current = generation.lock().unwrap_or_else(|p| p.into_inner());
+                let _ = wake.wait_timeout(current, Duration::from_secs(wait.min(60)));
+                if !started.load(Ordering::Acquire) {
+                    break;
+                }
                 this.trigger();
             }
         });
     }
 
+    pub fn stop(&self) {
+        self.started.store(false, Ordering::Release);
+        let mut generation = self.wake.0.lock().unwrap_or_else(|p| p.into_inner());
+        *generation = generation.wrapping_add(1);
+        self.wake.1.notify_all();
+    }
+
     pub fn catch_up(&self, state: &SchedulerState, now: i64) -> Option<String> {
+        let schedule = self.schedule_snapshot()?;
         let cycle = self.cycle_id(now);
-        CatchUp::should_run(&cycle, now, state, &self.schedule).then_some(cycle)
+        CatchUp::should_run(&cycle, now, state, &schedule).then_some(cycle)
     }
     pub fn next_due(&self, now: i64) -> i64 {
-        self.schedule.next_due(now)
+        self.schedule_snapshot()
+            .map_or_else(|| now.saturating_add(60), |schedule| schedule.next_due(now))
     }
 
     /// 返回稳定周期标识；计划配置变更后不会复用旧周期记录。
     pub fn cycle_id(&self, now: i64) -> String {
+        let Some(schedule) = self.schedule_snapshot() else {
+            return format!("{}:disabled", self.config_version);
+        };
         let current = Local
             .timestamp_opt(now, 0)
             .single()
             .unwrap_or_else(Local::now);
-        let date = match self.schedule {
-            Schedule::Daily { .. } => current.date_naive(),
-            Schedule::Weekly { .. } => {
+        let (schedule_key, date) = match schedule {
+            Schedule::Daily { time } => (
+                format!("daily-{}", time.format("%H-%M")),
+                current.date_naive(),
+            ),
+            Schedule::Weekly { weekday, time } => {
                 let d = current.date_naive();
-                d - chrono::Duration::days(d.weekday().num_days_from_monday() as i64)
+                (
+                    format!(
+                        "weekly-{}-{}",
+                        weekday.num_days_from_monday(),
+                        time.format("%H-%M")
+                    ),
+                    d - chrono::Duration::days(d.weekday().num_days_from_monday() as i64),
+                )
             }
         };
-        format!("{}:{}", self.config_version, date.format("%Y-%m-%d"))
+        format!(
+            "{}:{}:{}",
+            self.config_version,
+            schedule_key,
+            date.format("%Y-%m-%d")
+        )
     }
 
     pub fn plan_visible_updates<I>(visible: EnabledEcosystems, snapshots: I) -> Vec<PackageTask>
@@ -250,6 +333,7 @@ impl Scheduler {
 mod tests {
     use super::*;
     use chrono::DateTime;
+    use std::sync::atomic::AtomicUsize;
 
     fn unix(value: &str) -> i64 {
         DateTime::parse_from_rfc3339(value).unwrap().timestamp()
@@ -291,5 +375,33 @@ mod tests {
         let tasks = Scheduler::plan_visible_updates(visible, snapshot_with_all_ecosystems());
         assert!(tasks.iter().all(|task| task.ecosystem == Ecosystem::Npm));
         assert_eq!(tasks.len(), 1);
+    }
+
+    #[test]
+    fn rejected_run_is_not_recorded_and_an_accepted_run_is_recorded_once() {
+        let scheduler = Scheduler::new(Schedule::daily("00:00").unwrap());
+        let accepted = Arc::new(AtomicBool::new(false));
+        let accepted_for_runner = accepted.clone();
+        scheduler.set_runner(move || accepted_for_runner.load(Ordering::Acquire));
+        let records = Arc::new(AtomicUsize::new(0));
+        let records_for_callback = records.clone();
+        scheduler.set_state_recorder(move |_| {
+            records_for_callback.fetch_add(1, Ordering::AcqRel);
+        });
+
+        scheduler.trigger();
+        assert_eq!(records.load(Ordering::Acquire), 0);
+        accepted.store(true, Ordering::Release);
+        scheduler.trigger();
+        scheduler.trigger();
+        assert_eq!(records.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn scheduler_state_round_trips_for_cross_restart_catch_up() {
+        let state = SchedulerState::default().record_cycle("v1:daily-09-00:2026-09-05");
+        let json = serde_json::to_string(&state).unwrap();
+        let restored: SchedulerState = serde_json::from_str(&json).unwrap();
+        assert!(restored.has_cycle("v1:daily-09-00:2026-09-05"));
     }
 }
