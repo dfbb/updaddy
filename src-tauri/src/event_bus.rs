@@ -53,31 +53,23 @@ impl EventBus {
                     database.append_log(entry)
                 }
                 WorkerEvent::PackageChanged { package, .. } => database.save_snapshot(package),
-                WorkerEvent::DiskUsage { ecosystem, package_id, disk_usage, .. } => {
-                    let snapshot = match database.load_snapshot(package_id) {
-                        Ok(value) => value,
-                        Err(err) => {
-                            let _ = database.append_log(&LogEntry { message: format!("event persistence failed: {err}"), emitted_at: chrono::Utc::now().timestamp(), stream: "error".into() });
-                            None
-                        }
-                    };
-                    let entry = crate::persistence::DiskUsageCacheEntry {
-                        ecosystem: serde_json::to_value(ecosystem).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_else(|| format!("{ecosystem:?}")),
-                        package_id: package_id.clone(),
-                        installed_version: snapshot.and_then(|s| s.current_version).unwrap_or_else(|| "unknown".into()),
-                        install_root: "unknown".into(),
-                        path_signature: String::new(),
-                        bytes: disk_usage.bytes,
-                        status: disk_usage.status,
-                        scanned_at: chrono::Utc::now().timestamp(),
-                    };
-                    database.upsert_disk_usage(&entry)
-                }
+                // DiskUsage 在 worker 完成测量时已经用完整缓存键持久化；
+                // 事件总线不再用不完整键覆盖缓存。
+                WorkerEvent::DiskUsage { .. } => Ok(()),
                 WorkerEvent::BatchSummary { batch_id, ecosystem, total, succeeded, failed, cancelled, .. } => {
                     database.append_log(&LogEntry { message: format!("batch {batch_id} {ecosystem:?}: total={total} succeeded={succeeded} failed={failed} cancelled={cancelled}"), emitted_at: chrono::Utc::now().timestamp(), stream: "batch-summary".into() })
                 }
             };
-            if let Err(err) = result { let _ = database.append_log(&LogEntry { message: format!("event persistence failed: {err}"), emitted_at: chrono::Utc::now().timestamp(), stream: "error".into() }); }
+            if let Err(err) = result {
+                let entry = LogEntry {
+                    message: format!("event persistence failed: {err}"),
+                    emitted_at: chrono::Utc::now().timestamp(),
+                    stream: "error".into(),
+                };
+                if let Err(log_error) = database.append_log(&entry) {
+                    eprintln!("updaddy: {log_error}");
+                }
+            }
         }
         let name = match &event {
             WorkerEvent::WorkerState { .. } => "worker-state",
@@ -87,8 +79,10 @@ impl EventBus {
             WorkerEvent::LogEntry { .. } => "log-entry",
             WorkerEvent::BatchSummary { .. } => "batch-summary",
         };
-        if let Some(app) = self.app.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+        let app = self.app.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        if let Some(app) = app {
             let _ = app.emit(name, &event);
+            crate::platform::tray::refresh(&app);
         }
     }
 
@@ -99,7 +93,9 @@ impl EventBus {
             stream: stream.into(),
         };
         if let Some(database) = &self.database {
-            let _ = database.append_log(&entry);
+            if let Err(error) = database.append_log(&entry) {
+                eprintln!("updaddy: {error}");
+            }
         }
         if let Some(app) = self.app.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
             let _ = app.emit("log-entry", &entry);

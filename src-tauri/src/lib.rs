@@ -10,6 +10,8 @@ pub mod proxy;
 pub mod scheduler;
 pub mod workers;
 
+use tauri::Manager;
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() -> tauri::Result<()> {
     let database = Some(std::sync::Arc::new(
@@ -17,18 +19,37 @@ pub fn run() -> tauri::Result<()> {
             .map_err(|e| tauri::Error::Setup((Box::new(e) as Box<dyn std::error::Error>).into()))?,
     ));
     let state = crate::commands::AppState::new(database);
+    let scheduler_state = state.clone();
     let event_bus = state.event_bus.clone();
     tauri::Builder::default()
         .plugin(tauri_plugin_autostart::Builder::new().build())
         .manage(state)
         .setup(move |app| {
             event_bus.attach_app(app.handle().clone());
-            let _ = crate::platform::tray::setup(&app.handle());
-            let scheduler = std::sync::Arc::new(crate::scheduler::Scheduler::new(
-                crate::scheduler::Schedule::daily("03:00").expect("valid default schedule"),
-            ));
-            scheduler.start();
-            let _ = crate::platform::macos::install_wake_listener(scheduler);
+            crate::platform::tray::setup(&app.handle()).map_err(|error| {
+                tauri::Error::Setup(
+                    (Box::new(std::io::Error::other(error)) as Box<dyn std::error::Error>).into(),
+                )
+            })?;
+            let settings = scheduler_state.settings_snapshot();
+            let schedule =
+                crate::commands::schedule_from_settings(&settings).unwrap_or_else(|| {
+                    crate::scheduler::Schedule::daily("03:00").expect("valid default schedule")
+                });
+            let scheduler = std::sync::Arc::new(crate::scheduler::Scheduler::new(schedule));
+            let scheduled_state = scheduler_state.clone();
+            scheduler.set_runner(move || {
+                if let Err(error) = crate::commands::submit_all_visible(&scheduled_state) {
+                    scheduled_state
+                        .event_bus
+                        .log(format!("计划更新失败：{error}"), "scheduler");
+                }
+            });
+            crate::platform::macos::install_wake_listener(scheduler).map_err(|error| {
+                tauri::Error::Setup(
+                    (Box::new(std::io::Error::other(error)) as Box<dyn std::error::Error>).into(),
+                )
+            })?;
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -50,5 +71,16 @@ pub fn run() -> tauri::Result<()> {
             commands::set_login_item,
             commands::open_settings,
         ])
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())?
+        .run(|app, event| {
+            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+                let state = app.state::<crate::commands::AppState>();
+                if !state.is_shutdown_started() {
+                    api.prevent_exit();
+                    state.shutdown();
+                    app.exit(0);
+                }
+            }
+        });
+    Ok(())
 }

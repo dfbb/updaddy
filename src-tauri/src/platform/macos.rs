@@ -7,7 +7,27 @@ pub fn install_wake_listener(_scheduler: Arc<Scheduler>) -> Result<(), String> {
     _scheduler.start();
     #[cfg(target_os = "macos")]
     {
-        // 原生 NSWorkspace 通知在 GUI 线程可用时由调度器幂等启动；无 GUI 测试环境安全跳过。
+        use block2::RcBlock;
+        use objc2_app_kit::{NSWorkspace, NSWorkspaceDidWakeNotification};
+        use objc2_foundation::{NSNotification, NSOperationQueue};
+        use std::ptr::NonNull;
+
+        let center = NSWorkspace::sharedWorkspace().notificationCenter();
+        let scheduler = _scheduler.clone();
+        let callback = RcBlock::new(move |_notification: NonNull<NSNotification>| {
+            scheduler.trigger();
+        });
+        let observer = unsafe {
+            center.addObserverForName_object_queue_usingBlock(
+                Some(NSWorkspaceDidWakeNotification),
+                None,
+                Some(&NSOperationQueue::mainQueue()),
+                &callback,
+            )
+        };
+        // NSNotificationCenter 持有 token；泄漏此 token 直到应用退出，
+        // 避免回调在 scheduler 生命周期内被提前释放。
+        std::mem::forget(observer);
     }
     Ok(())
 }

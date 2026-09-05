@@ -3935,6 +3935,7 @@ name = "updaddy"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "block2",
  "chrono",
  "libc",
  "objc2",

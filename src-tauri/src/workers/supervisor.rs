@@ -1,5 +1,8 @@
 use std::collections::HashMap;
-use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc, Mutex, OnceLock,
+};
 use std::thread::{self, JoinHandle};
 
 use tokio::runtime::Builder;
@@ -62,6 +65,7 @@ pub struct WorkerSupervisor {
     handles: Mutex<Vec<JoinHandle<()>>>,
     database: Option<Arc<Database>>,
     batch_gate: Mutex<()>,
+    shutdown_started: AtomicBool,
 }
 
 impl WorkerSupervisor {
@@ -209,6 +213,46 @@ impl WorkerSupervisor {
             handles: Mutex::new(handles),
             database: context.database,
             batch_gate: Mutex::new(()),
+            shutdown_started: AtomicBool::new(false),
+        }
+    }
+
+    /// 显式关闭所有生态 worker。调用方应在退出事件中先调用此方法，
+    /// `Drop` 仅作为异常路径兜底，避免依赖析构顺序来完成收尾。
+    pub fn shutdown(&self) {
+        if self.shutdown_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let active_ids = self
+            .cancellations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        for token in self
+            .cancellations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+        {
+            token.cancel();
+        }
+        if let Some(database) = &self.database {
+            for task_id in active_ids {
+                let _ = database.update_task(task_id, TaskStatus::Cancelled, None);
+            }
+        }
+        for sender in self.senders.values() {
+            let _ = sender.send(Envelope {
+                id: Uuid::new_v4(),
+                command: WorkerCommand::Shutdown,
+                cancel: CancellationToken::new(),
+            });
+        }
+        let handles = std::mem::take(&mut *self.handles.lock().unwrap_or_else(|p| p.into_inner()));
+        for handle in handles {
+            let _ = handle.join();
         }
     }
 
@@ -223,7 +267,12 @@ impl WorkerSupervisor {
         for command in commands {
             match self.submit(command) {
                 Ok(id) => ids.push(id),
-                Err(err) => { for id in &ids { let _ = self.cancel(*id); } return Err(err); }
+                Err(err) => {
+                    for id in &ids {
+                        let _ = self.cancel(*id);
+                    }
+                    return Err(err);
+                }
             }
         }
         Ok(ids)
@@ -323,23 +372,7 @@ impl WorkerSupervisor {
 
 impl Drop for WorkerSupervisor {
     fn drop(&mut self) {
-        for token in self
-            .cancellations
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .values()
-        {
-            token.cancel();
-        }
-        for sender in self.senders.values() {
-            let _ = sender.send(Envelope {
-                id: Uuid::new_v4(),
-                command: WorkerCommand::Shutdown,
-                cancel: CancellationToken::new(),
-            });
-        }
-        let handles = std::mem::take(&mut *self.handles.lock().unwrap_or_else(|p| p.into_inner()));
-        for handle in handles { let _ = handle.join(); }
+        self.shutdown();
     }
 }
 

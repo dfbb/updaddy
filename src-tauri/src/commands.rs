@@ -1,8 +1,11 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 
 use serde::{Deserialize, Serialize};
-use tauri::{State, Manager, Emitter};
+use tauri::{Emitter, Manager, State};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -67,6 +70,7 @@ pub struct AppState {
     pub event_bus: EventBus,
     settings: Arc<Mutex<Settings>>,
     pub(crate) test_events: Option<Arc<Mutex<Vec<WorkerEvent>>>>,
+    shutdown_started: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -78,13 +82,27 @@ impl AppState {
             event_sink: bus.sink(),
             executor: crate::adapters::ExecutorContext::new(),
         });
-        let settings = database.as_ref().and_then(|db| db.load_setting("settings").ok().flatten()).and_then(|raw| serde_json::from_str(&raw).ok()).unwrap_or_default();
+        let settings = match database.as_ref() {
+            Some(db) => match db.load_setting("settings") {
+                Ok(Some(raw)) => serde_json::from_str(&raw).unwrap_or_else(|error| {
+                    eprintln!("updaddy: invalid persisted settings: {error}");
+                    Settings::default()
+                }),
+                Ok(None) => Settings::default(),
+                Err(error) => {
+                    eprintln!("updaddy: failed to load settings: {error}");
+                    Settings::default()
+                }
+            },
+            None => Settings::default(),
+        };
         Self {
             supervisor: Arc::new(supervisor),
             database,
             event_bus: bus,
             settings: Arc::new(Mutex::new(settings)),
             test_events: None,
+            shutdown_started: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -133,8 +151,43 @@ impl AppState {
             event_bus: EventBus::new(None),
             settings: Arc::new(Mutex::new(Settings::default())),
             test_events: Some(events),
+            shutdown_started: Arc::new(AtomicBool::new(false)),
         }
     }
+
+    pub fn shutdown(&self) {
+        if self.shutdown_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.supervisor.shutdown();
+    }
+
+    pub fn is_shutdown_started(&self) -> bool {
+        self.shutdown_started.load(Ordering::Acquire)
+    }
+
+    pub fn settings_snapshot(&self) -> Settings {
+        self.settings
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+}
+
+/// 将持久化设置转换为 scheduler 使用的强类型计划。
+pub fn schedule_from_settings(settings: &Settings) -> Option<crate::scheduler::Schedule> {
+    let raw = settings.schedule.as_deref()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Some(value) = raw.strip_prefix("weekly:") {
+        let (weekday, time) = value.split_once(' ')?;
+        return crate::scheduler::Schedule::weekly(weekday, time).ok();
+    }
+    if let Some((weekday, time)) = raw.split_once(' ') {
+        return crate::scheduler::Schedule::weekly(weekday, time).ok();
+    }
+    crate::scheduler::Schedule::daily(raw).ok()
 }
 
 fn ensure_visible(app: &AppState, ecosystem: Ecosystem) -> Result<(), String> {
@@ -189,7 +242,16 @@ pub fn uninstall_package(app: State<'_, AppState>, package: PackageId) -> Result
 
 #[tauri::command]
 pub fn update_all_visible(app: State<'_, AppState>) -> Result<Vec<TaskId>, String> {
-    let snapshots = app.database.as_ref().map(|db| db.list_snapshots().map_err(|e| e.to_string())).transpose()?.unwrap_or_default();
+    submit_all_visible(&app)
+}
+
+pub fn submit_all_visible(app: &AppState) -> Result<Vec<TaskId>, String> {
+    let snapshots = app
+        .database
+        .as_ref()
+        .map(|db| db.list_snapshots().map_err(|e| e.to_string()))
+        .transpose()?
+        .unwrap_or_default();
     let visible = crate::scheduler::EnabledEcosystems::only(
         &Ecosystem::ALL
             .into_iter()
@@ -215,18 +277,29 @@ pub fn get_state_snapshot(app: State<'_, AppState>) -> Result<StateSnapshot, Str
     let mut workers = HashMap::new();
     if let Some(db) = &app.database {
         for ecosystem in Ecosystem::ALL {
-            if let Some((state, _)) = db.worker_state(ecosystem).map_err(|e| e.to_string())? { workers.insert(ecosystem, state); }
+            if let Some((state, _)) = db.worker_state(ecosystem).map_err(|e| e.to_string())? {
+                workers.insert(ecosystem, state);
+            }
         }
     }
     let packages = app
         .database
         .as_ref()
-        .map(|db| db.list_snapshots().map_err(|e| e.to_string())).transpose()?.unwrap_or_default();
+        .map(|db| db.list_snapshots().map_err(|e| e.to_string()))
+        .transpose()?
+        .unwrap_or_default();
     let logs = app
         .database
         .as_ref()
-        .map(|db| db.list_logs().map_err(|e| e.to_string())).transpose()?.unwrap_or_default();
-    let tasks = app.database.as_ref().map(|db| db.list_tasks().map_err(|e| e.to_string())).transpose()?.unwrap_or_default();
+        .map(|db| db.list_logs().map_err(|e| e.to_string()))
+        .transpose()?
+        .unwrap_or_default();
+    let tasks = app
+        .database
+        .as_ref()
+        .map(|db| db.list_tasks().map_err(|e| e.to_string()))
+        .transpose()?
+        .unwrap_or_default();
     Ok(StateSnapshot {
         workers,
         packages,
@@ -238,7 +311,13 @@ pub fn get_state_snapshot(app: State<'_, AppState>) -> Result<StateSnapshot, Str
 
 #[tauri::command]
 pub fn get_settings(app: State<'_, AppState>) -> Result<Settings, String> {
-    if let Some(db) = &app.database { if let Some(raw) = db.load_setting("settings").map_err(|e| e.to_string())? { if let Ok(s) = serde_json::from_str(&raw) { *app.settings.lock().unwrap_or_else(|p| p.into_inner()) = s; } } }
+    if let Some(db) = &app.database {
+        if let Some(raw) = db.load_setting("settings").map_err(|e| e.to_string())? {
+            if let Ok(s) = serde_json::from_str(&raw) {
+                *app.settings.lock().unwrap_or_else(|p| p.into_inner()) = s;
+            }
+        }
+    }
     Ok(app
         .settings
         .lock()
@@ -248,27 +327,60 @@ pub fn get_settings(app: State<'_, AppState>) -> Result<Settings, String> {
 
 #[tauri::command]
 pub fn save_settings(app: State<'_, AppState>, settings: Settings) -> Result<(), String> {
-    if !matches!(settings.theme.as_str(), "system"|"light"|"dark") { return Err("主题无效".into()); }
-    if settings.locale.trim().is_empty() || settings.visible_ecosystems.is_empty() { return Err("设置无效".into()); }
+    if !matches!(settings.theme.as_str(), "system" | "light" | "dark") {
+        return Err("主题无效".into());
+    }
+    if settings.locale.trim().is_empty() || settings.visible_ecosystems.is_empty() {
+        return Err("设置无效".into());
+    }
     if let Some(schedule) = &settings.schedule {
         if !schedule.is_empty() {
-            let valid = if let Some((day, time)) = schedule.strip_prefix("weekly:").and_then(|s| s.split_once(' ')) {
+            let valid = if let Some((day, time)) = schedule
+                .strip_prefix("weekly:")
+                .and_then(|s| s.split_once(' '))
+            {
                 crate::scheduler::Schedule::weekly(day, time).is_ok()
             } else if let Some((day, time)) = schedule.split_once(' ') {
                 crate::scheduler::Schedule::weekly(day, time).is_ok()
-            } else { crate::scheduler::Schedule::daily(schedule).is_ok() };
-            if !valid { return Err("计划时间无效".into()); }
+            } else {
+                crate::scheduler::Schedule::daily(schedule).is_ok()
+            };
+            if !valid {
+                return Err("计划时间无效".into());
+            }
         }
     }
-    if let Some(db) = &app.database { db.save_setting("settings", &serde_json::to_string(&settings).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?; }
+    if let Some(db) = &app.database {
+        db.save_setting(
+            "settings",
+            &serde_json::to_string(&settings).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+    }
     *app.settings.lock().unwrap_or_else(|p| p.into_inner()) = settings;
     Ok(())
 }
 
 #[tauri::command]
-pub fn set_login_item(app: State<'_, AppState>, handle: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+pub fn set_login_item(
+    app: State<'_, AppState>,
+    handle: tauri::AppHandle,
+    enabled: bool,
+) -> Result<(), String> {
     crate::platform::login_item::set_enabled(&handle, enabled)?;
-    if let Some(db) = &app.database { let mut settings = app.settings.lock().unwrap_or_else(|p| p.into_inner()).clone(); settings.login_item = enabled; db.save_setting("settings", &serde_json::to_string(&settings).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?; }
+    if let Some(db) = &app.database {
+        let mut settings = app
+            .settings
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        settings.login_item = enabled;
+        db.save_setting(
+            "settings",
+            &serde_json::to_string(&settings).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+    }
     app.settings
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -278,7 +390,11 @@ pub fn set_login_item(app: State<'_, AppState>, handle: tauri::AppHandle, enable
 
 #[tauri::command]
 pub fn open_settings(app: tauri::AppHandle) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window("main") { window.show().map_err(|e| e.to_string())?; window.set_focus().map_err(|e| e.to_string())?; let _ = window.emit("open-settings", ()); }
+    if let Some(window) = app.get_webview_window("main") {
+        window.show().map_err(|e| e.to_string())?;
+        window.set_focus().map_err(|e| e.to_string())?;
+        let _ = window.emit("open-settings", ());
+    }
     Ok(())
 }
 
