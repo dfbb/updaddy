@@ -6,9 +6,9 @@ import EcosystemTabs from "./components/EcosystemTabs";
 import HistoryPage from "./components/HistoryPage";
 import OverviewPage from "./components/OverviewPage";
 import SettingsPage from "./components/SettingsPage";
-import { applyEvent, applySnapshot, setSettings, useAppStore } from "./state/appStore";
+import { applyEvents, applySnapshot, setSettings, useAppStore } from "./state/appStore";
 import { setTheme } from "./theme/theme";
-import type { Ecosystem } from "./types";
+import type { BackendEvent, Ecosystem } from "./types";
 
 export default function App() {
   const theme = useAppStore((state) => state.theme);
@@ -22,16 +22,30 @@ export default function App() {
   useEffect(() => {
     let unlisten: (() => void)[] = [];
     let mounted = true;
+    let flushTimer: number | undefined;
+    let pendingEvents: Array<readonly [string, BackendEvent]> = [];
+    const queueEvent = (name: string, payload: BackendEvent) => {
+      pendingEvents.push([name, payload]);
+      if (flushTimer !== undefined) return;
+      flushTimer = window.setTimeout(() => {
+        flushTimer = undefined;
+        const events = pendingEvents;
+        pendingEvents = [];
+        if (mounted) applyEvents(events);
+      }, 16);
+    };
     void Promise.all([
       getSettings().then(setSettings).catch(() => undefined),
       getStateSnapshot().then(applySnapshot).catch(() => undefined),
-      subscribeToBackendEvents((name, payload) => applyEvent(name, payload)).then((fns) => {
+      subscribeToBackendEvents(queueEvent).then((fns) => {
         if (mounted) unlisten = fns;
         else fns.forEach((fn) => fn());
       }).catch(() => undefined),
     ]);
     return () => {
       mounted = false;
+      if (flushTimer !== undefined) window.clearTimeout(flushTimer);
+      pendingEvents = [];
       unlisten.forEach((fn) => fn());
     };
   }, []);

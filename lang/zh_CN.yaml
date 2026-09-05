@@ -25,6 +25,12 @@ task:
   cancel: 取消
   progress_label: 任务进度
   ecosystem_scan: 生态扫描
+  scan_detail: 正在读取已安装软件包和磁盘占用
+  update_detail: 正在等待包管理器完成 {name} 更新
+  uninstall_detail: 正在等待包管理器完成 {name} 卸载
+  measure_disk_detail: 正在计算 {name} 的磁盘占用
+  download_detail: "{downloaded} / {total}（{percent}%）· 预计剩余 {eta}"
+  download_detail_no_eta: "{downloaded} / {total}（{percent}%）"
 worker:
   idle: 就绪
 operations:

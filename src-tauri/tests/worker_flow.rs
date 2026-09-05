@@ -115,6 +115,17 @@ fn retry_rescans_and_revalidates_before_updating() {
         assert!(!remaining.is_zero(), "retry task did not complete");
         guard = events.1.wait_timeout(guard, remaining).unwrap().0;
     }
+    assert!(guard.iter().any(|event| {
+        matches!(
+            event,
+            WorkerEvent::TaskProgress {
+                task_id: id,
+                name,
+                operation: Operation::Update,
+                ..
+            } if *id == task_id && name == "eslint"
+        )
+    }));
     assert!(*scanned.lock().unwrap());
     assert!(*updated.lock().unwrap());
 }

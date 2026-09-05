@@ -128,6 +128,7 @@ impl WorkerSupervisor {
                     let id = envelope.id;
                     let command = envelope.command;
                     let cancel = envelope.cancel;
+                    let progress_task = super::worker::command_task(id, ecosystem, &command);
                     if cancel.is_cancelled() {
                         let update = database.as_ref().map_or(Ok(true), |database| {
                             database.update_task(id, TaskStatus::Cancelled, None)
@@ -136,6 +137,8 @@ impl WorkerSupervisor {
                             sink(WorkerEvent::TaskProgress {
                                 task_id: id,
                                 ecosystem,
+                                name: progress_task.name.clone(),
+                                operation: progress_task.operation,
                                 sequence: {
                                     sequence += 1;
                                     sequence
@@ -143,6 +146,7 @@ impl WorkerSupervisor {
                                 status: TaskStatus::Failed,
                                 completed: 1,
                                 total: 1,
+                                eta_seconds: None,
                                 message: Some(
                                     match update {
                                         Ok(false) => "database task missing",
@@ -158,6 +162,8 @@ impl WorkerSupervisor {
                             sink(WorkerEvent::TaskProgress {
                                 task_id: id,
                                 ecosystem,
+                                name: progress_task.name.clone(),
+                                operation: progress_task.operation,
                                 sequence: {
                                     sequence += 1;
                                     sequence
@@ -165,6 +171,7 @@ impl WorkerSupervisor {
                                 status: crate::core::TaskStatus::Cancelled,
                                 completed: 1,
                                 total: 1,
+                                eta_seconds: None,
                                 message: None,
                                 error: None,
                                 emitted_at: chrono::Utc::now().timestamp(),
@@ -198,6 +205,8 @@ impl WorkerSupervisor {
                         sink(WorkerEvent::TaskProgress {
                             task_id: id,
                             ecosystem,
+                            name: progress_task.name.clone(),
+                            operation: progress_task.operation,
                             sequence: {
                                 sequence += 1;
                                 sequence
@@ -205,6 +214,7 @@ impl WorkerSupervisor {
                             status: TaskStatus::Failed,
                             completed: 1,
                             total: 1,
+                            eta_seconds: None,
                             message: Some("worker panicked".into()),
                             error: Some(crate::core::TaskErrorKind::Unknown),
                             emitted_at: chrono::Utc::now().timestamp(),

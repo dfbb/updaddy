@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 use super::Redactor;
 
 pub type EventSink = Arc<dyn Fn(OutputEvent) + Send + Sync + 'static>;
+pub type OutputChunkSink = Arc<dyn Fn(&[u8]) + Send + Sync + 'static>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputEvent {
@@ -32,6 +33,8 @@ pub struct CommandSpec {
     pub env: HashMap<String, String>,
     pub cwd: Option<PathBuf>,
     pub stdin: Option<Vec<u8>>,
+    pub pseudo_terminal: bool,
+    pub(crate) output_chunk_sink: Option<OutputChunkSink>,
 }
 
 impl std::fmt::Debug for CommandSpec {
@@ -51,6 +54,8 @@ impl std::fmt::Debug for CommandSpec {
                 "stdin",
                 &self.stdin.as_ref().map(|v| format!("<{} bytes>", v.len())),
             )
+            .field("pseudo_terminal", &self.pseudo_terminal)
+            .field("has_output_chunk_sink", &self.output_chunk_sink.is_some())
             .finish()
     }
 }
@@ -63,6 +68,8 @@ impl CommandSpec {
             env: HashMap::new(),
             cwd: None,
             stdin: None,
+            pseudo_terminal: false,
+            output_chunk_sink: None,
         }
     }
 }
@@ -117,12 +124,27 @@ impl ProcessSupervisor {
         timeout: Duration,
     ) -> Result<CommandResult, ProcessError> {
         let started = std::time::Instant::now();
-        let mut command = Command::new(&spec.program);
+        let mut command = if spec.pseudo_terminal && cfg!(target_os = "macos") {
+            let mut command = Command::new("/usr/bin/script");
+            command.args(["-q", "/dev/null", &spec.program]);
+            command.args(&spec.args);
+            command
+        } else {
+            let mut command = Command::new(&spec.program);
+            command.args(&spec.args);
+            command
+        };
         command
-            .args(&spec.args)
             .env_clear()
             .envs(&spec.env)
-            .env("TERM", "dumb")
+            .env(
+                "TERM",
+                if spec.pseudo_terminal {
+                    "xterm-256color"
+                } else {
+                    "dumb"
+                },
+            )
             .current_dir(
                 spec.cwd.unwrap_or_else(|| {
                     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
@@ -168,8 +190,15 @@ impl ProcessSupervisor {
             "stdout",
             event_sink.clone(),
             secrets.clone(),
+            spec.output_chunk_sink.clone(),
         ));
-        let stderr_task = tokio::spawn(read_output(stderr, "stderr", event_sink, secrets));
+        let stderr_task = tokio::spawn(read_output(
+            stderr,
+            "stderr",
+            event_sink,
+            secrets,
+            spec.output_chunk_sink,
+        ));
 
         let status = tokio::select! {
             status = child.wait() => status.map_err(ProcessError::Io)?,
@@ -210,6 +239,7 @@ async fn read_output<R: AsyncRead + Unpin>(
     stream: &str,
     event_sink: EventSink,
     secrets: Vec<String>,
+    output_chunk_sink: Option<OutputChunkSink>,
 ) -> Result<String, io::Error> {
     let mut bytes = Vec::new();
     let mut pending = Vec::new();
@@ -221,6 +251,10 @@ async fn read_output<R: AsyncRead + Unpin>(
         let count = reader.read(&mut chunk).await?;
         if count == 0 {
             break;
+        }
+        if let Some(sink) = &output_chunk_sink {
+            // Chunk consumers derive numeric progress only; raw bytes never leave the backend.
+            sink(&chunk[..count]);
         }
         bytes.extend_from_slice(&chunk[..count]);
         pending.extend_from_slice(&chunk[..count]);
@@ -387,6 +421,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn output_chunks_are_available_before_a_trailing_newline() {
+        let chunks = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collected = chunks.clone();
+        let mut spec = CommandSpec::for_test("printf", &["10.0MB/100.0MB"]);
+        spec.pseudo_terminal = true;
+        spec.output_chunk_sink = Some(Arc::new(move |chunk| {
+            collected.lock().unwrap().extend_from_slice(chunk);
+        }));
+
+        ProcessSupervisor::run(spec, CancellationToken::new(), sink())
+            .await
+            .unwrap();
+
+        assert!(String::from_utf8_lossy(&chunks.lock().unwrap()).contains("10.0MB/100.0MB"));
+    }
+
+    #[tokio::test]
     async fn output_reader_preserves_utf8_split_across_chunks() {
         let (mut writer, reader) = tokio::io::duplex(16);
         let write_task = tokio::spawn(async move {
@@ -398,7 +449,7 @@ mod tests {
         let event_sink: EventSink = Arc::new(move |event| {
             collected.lock().unwrap().push(event);
         });
-        let output = read_output(reader, "stdout", event_sink, Vec::new())
+        let output = read_output(reader, "stdout", event_sink, Vec::new(), None)
             .await
             .unwrap();
         write_task.await.unwrap();
@@ -422,6 +473,7 @@ mod tests {
             "stdout",
             event_sink,
             vec!["line1\nline2".to_owned()],
+            None,
         )
         .await
         .unwrap();

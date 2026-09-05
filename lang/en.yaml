@@ -25,6 +25,12 @@ task:
   cancel: Cancel
   progress_label: Task progress
   ecosystem_scan: ecosystem scan
+  scan_detail: Reading installed packages and disk usage
+  update_detail: Waiting for the package manager to finish updating {name}
+  uninstall_detail: Waiting for the package manager to finish uninstalling {name}
+  measure_disk_detail: Calculating disk usage for {name}
+  download_detail: "{downloaded} / {total} ({percent}%) · about {eta} remaining"
+  download_detail_no_eta: "{downloaded} / {total} ({percent}%)"
 worker:
   idle: Ready
 operations:

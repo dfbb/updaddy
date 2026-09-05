@@ -19,6 +19,7 @@ const setState = (next: Partial<AppState>) => { state = { ...state, ...next }; e
 export function useAppStore<T = AppState>(selector: (s: AppState) => T = ((s) => s as T)) { return useSyncExternalStore((l) => { listeners.add(l); return () => listeners.delete(l); }, () => selector(state), () => selector(state)); }
 export function setSettings(settings: Settings) { setTheme(settings.theme); setState({ settings, locale: resolveLocale(settings.locale), theme: settings.theme, visibleEcosystems: settings.visible_ecosystems, totalUpdates: updateCount(state.packages, settings.visible_ecosystems) }); }
 function isActive(status: PackageTask["status"] | string) { return status === "pending" || status === "running"; }
+function isVisibleTask(task: PackageTask) { return isActive(task.status) && task.operation !== "measure_disk"; }
 function derivedOperationsDisabled(tasks: PackageTask[], workers: Record<string, string>) {
   return tasks.some((task) => isActive(task.status)) || Object.values(workers).some((worker) => ["running", "scanning", "updating", "uninstalling"].includes(worker.toLowerCase()));
 }
@@ -29,12 +30,13 @@ function effectiveVisible(configured: Ecosystem[], workers: Record<string, strin
   return configured.filter((ecosystem) => !["missing", "disabled"].includes((workers[ecosystem] ?? "").toLowerCase()));
 }
 export function applySnapshot(snapshot: StateSnapshot) {
-  const active = snapshot.tasks.filter((t) => isActive(t.status)).map((t) => t.task_id);
+  const tasks = snapshot.tasks.filter(isVisibleTask);
+  const active = tasks.map((t) => t.task_id);
   const visibleEcosystems = effectiveVisible(state.settings.visible_ecosystems, snapshot.workers);
-  setState({ workers: snapshot.workers, visibleEcosystems, packages: snapshot.packages, logs: snapshot.logs, tasks: snapshot.tasks, batches: snapshot.batches ?? [], activeTaskIds: active, operationsDisabled: snapshot.active_tasks > 0 || derivedOperationsDisabled(snapshot.tasks, snapshot.workers), totalUpdates: updateCount(snapshot.packages, visibleEcosystems) });
+  setState({ workers: snapshot.workers, visibleEcosystems, packages: snapshot.packages, logs: snapshot.logs, tasks, batches: snapshot.batches ?? [], activeTaskIds: active, operationsDisabled: snapshot.active_tasks > 0 || derivedOperationsDisabled(tasks, snapshot.workers), totalUpdates: updateCount(snapshot.packages, visibleEcosystems) });
 }
-export function applyEvent(name: string, payload: BackendEvent) {
-  let tasks = state.tasks;
+function reduceEvent(current: AppState, name: string, payload: BackendEvent): AppState {
+  let tasks = current.tasks;
   if (name === "task-progress" && payload.task_id) {
     const existing = tasks.find((task) => task.task_id === payload.task_id);
     const next: PackageTask = {
@@ -46,16 +48,28 @@ export function applyEvent(name: string, payload: BackendEvent) {
       error: payload.error,
       completed: typeof payload.completed === "number" ? payload.completed : existing?.completed,
       total: typeof payload.total === "number" ? payload.total : existing?.total,
+      eta_seconds: typeof payload.eta_seconds === "number" ? payload.eta_seconds : existing?.eta_seconds,
       message: payload.message ?? existing?.message,
     };
-    tasks = existing ? tasks.map((task) => task.task_id === payload.task_id ? { ...task, ...next } : task) : [...tasks, next];
+    if (isVisibleTask(next)) {
+      tasks = existing ? tasks.map((task) => task.task_id === payload.task_id ? { ...task, ...next } : task) : [...tasks, next];
+    } else if (existing) {
+      tasks = tasks.filter((task) => task.task_id !== payload.task_id);
+    }
   }
-  const packages = name === "package-changed" && payload.package ? [...state.packages.filter((p) => p.id !== payload.package.id), payload.package] : name === "disk-usage" && payload.package_id ? state.packages.map((p) => p.id === payload.package_id ? { ...p, disk_usage: payload.disk_usage } : p) : state.packages;
+  const packages = name === "package-changed" && payload.package ? [...current.packages.filter((p) => p.id !== payload.package.id), payload.package] : name === "disk-usage" && payload.package_id ? current.packages.map((p) => p.id === payload.package_id ? { ...p, disk_usage: payload.disk_usage } : p) : current.packages;
   const logEntry = name === "log-entry" ? (payload.entry ?? (payload.message ? { message: payload.message, emitted_at: payload.emitted_at, stream: payload.stream ?? "system" } : undefined)) : undefined;
-  const logs = logEntry ? [...state.logs, logEntry] : state.logs;
-  const workers = name === "worker-state" ? { ...state.workers, [payload.ecosystem]: payload.state } : state.workers;
-  const visibleEcosystems = name === "worker-state" ? effectiveVisible(state.settings.visible_ecosystems, workers) : state.visibleEcosystems;
-  const active = tasks.filter((t) => isActive(t.status)).map((t) => t.task_id);
-  setState({ tasks, packages, logs, workers, visibleEcosystems, activeTaskIds: active, operationsDisabled: derivedOperationsDisabled(tasks, workers), totalUpdates: updateCount(packages, visibleEcosystems), lastBatchSummary: name === "batch-summary" ? payload : state.lastBatchSummary });
+  const logs = logEntry ? [...current.logs, logEntry] : current.logs;
+  const workers = name === "worker-state" ? { ...current.workers, [payload.ecosystem]: payload.state } : current.workers;
+  const visibleEcosystems = name === "worker-state" ? effectiveVisible(current.settings.visible_ecosystems, workers) : current.visibleEcosystems;
+  return { ...current, tasks, packages, logs, workers, visibleEcosystems, lastBatchSummary: name === "batch-summary" ? payload : current.lastBatchSummary };
 }
+export function applyEvents(events: ReadonlyArray<readonly [string, BackendEvent]>) {
+  if (events.length === 0) return;
+  const next = events.reduce((current, [name, payload]) => reduceEvent(current, name, payload), state);
+  const active = next.tasks.map((task) => task.task_id);
+  state = { ...next, activeTaskIds: active, operationsDisabled: derivedOperationsDisabled(next.tasks, next.workers), totalUpdates: updateCount(next.packages, next.visibleEcosystems) };
+  emit();
+}
+export function applyEvent(name: string, payload: BackendEvent) { applyEvents([[name, payload]]); }
 export const getAppState = () => state;

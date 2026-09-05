@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use crate::core::{Ecosystem, PackageRecord, PackageTask, ResourceKind, TaskErrorKind};
 use crate::disk_usage::{resolve_package_paths, PackageInstallPaths};
 use crate::executor::{
-    sink, CommandResult, CommandSpec, EventSink, ProcessError, ProcessSupervisor,
+    sink, CommandResult, CommandSpec, EventSink, OutputChunkSink, ProcessError, ProcessSupervisor,
 };
 pub use crate::proxy::ProxyEnv;
 use crate::proxy::{is_proxy_env_key, ProxyCapability, ProxyConfig, ProxyRuntime};
@@ -53,6 +53,7 @@ pub struct ExecutorContext {
     pub proxy: ProxyEnv,
     runner: Arc<dyn CommandRunner>,
     proxy_runtime: Arc<RwLock<Option<Arc<ProxyRuntime>>>>,
+    output_chunk_sink: Option<OutputChunkSink>,
 }
 
 pub fn home_dir() -> PathBuf {
@@ -84,6 +85,7 @@ impl ExecutorContext {
             proxy: ProxyEnv::default(),
             runner: Arc::new(ProcessCommandRunner::default()),
             proxy_runtime: Arc::new(RwLock::new(None)),
+            output_chunk_sink: None,
         }
     }
 
@@ -92,6 +94,7 @@ impl ExecutorContext {
             proxy: ProxyEnv::default(),
             runner,
             proxy_runtime: Arc::new(RwLock::new(None)),
+            output_chunk_sink: None,
         }
     }
 
@@ -100,11 +103,17 @@ impl ExecutorContext {
             proxy: ProxyEnv::default(),
             runner: Arc::new(ProcessCommandRunner { output_sink }),
             proxy_runtime: Arc::new(RwLock::new(None)),
+            output_chunk_sink: None,
         }
     }
 
     pub fn with_proxy(mut self, proxy: ProxyEnv) -> Self {
         self.proxy = proxy;
+        self
+    }
+
+    pub fn with_output_chunk_sink(mut self, sink: OutputChunkSink) -> Self {
+        self.output_chunk_sink = Some(sink);
         self
     }
 
@@ -189,6 +198,9 @@ impl ExecutorContext {
         spec.env
             .entry("HOME".to_owned())
             .or_insert_with(|| home_dir().to_string_lossy().into_owned());
+        if spec.output_chunk_sink.is_none() {
+            spec.output_chunk_sink = self.output_chunk_sink.clone();
+        }
         for key in [
             "NPM_CONFIG_PREFIX",
             "GEM_HOME",
@@ -582,6 +594,8 @@ pub fn command(program: &str, args: impl IntoIterator<Item = impl AsRef<str>>) -
         env: HashMap::new(),
         cwd: None,
         stdin: None,
+        pseudo_terminal: false,
+        output_chunk_sink: None,
     }
 }
 

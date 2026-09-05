@@ -8,7 +8,9 @@ pub use supervisor::{
 };
 pub use worker::{EcosystemAdapter, NoopAdapter};
 
-use crate::core::{DiskUsage, Ecosystem, LogEntry, PackageRecord, TaskErrorKind, TaskStatus};
+use crate::core::{
+    DiskUsage, Ecosystem, LogEntry, Operation, PackageRecord, TaskErrorKind, TaskStatus,
+};
 use serde::Serialize;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -27,10 +29,13 @@ pub enum WorkerEvent {
     TaskProgress {
         task_id: Uuid,
         ecosystem: Ecosystem,
+        name: String,
+        operation: Operation,
         sequence: u64,
         status: TaskStatus,
         completed: u64,
         total: u64,
+        eta_seconds: Option<u64>,
         message: Option<String>,
         error: Option<TaskErrorKind>,
         emitted_at: i64,

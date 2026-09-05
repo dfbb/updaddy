@@ -4,6 +4,7 @@ mod process;
 mod redaction;
 
 pub use process::{
-    sink, CommandResult, CommandSpec, EventSink, OutputEvent, ProcessError, ProcessSupervisor,
+    sink, CommandResult, CommandSpec, EventSink, OutputChunkSink, OutputEvent, ProcessError,
+    ProcessSupervisor,
 };
 pub use redaction::Redactor;

@@ -1,19 +1,20 @@
 #![allow(clippy::items_after_test_module)]
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::adapters::ExecutorContext;
+use crate::adapters::{ExecutorContext, HomebrewProgressTracker};
 use crate::core::{
     DiskUsage, DiskUsageStatus, Ecosystem, Operation, PackageRecord, PackageTask, TaskErrorKind,
     TaskStatus,
 };
 use crate::disk_usage::{CacheStore, DiskUsageError, DiskUsageService, PackageInstallPaths};
+use crate::executor::OutputChunkSink;
 use crate::persistence::Database;
 
 use super::messages::WorkerCommand;
@@ -180,6 +181,7 @@ pub(crate) async fn run_command(
     sequence: &mut u64,
     executor: ExecutorContext,
 ) {
+    let progress_task = command_task(task_id, ecosystem, &command);
     *sequence += 1;
     emit_state(ecosystem, "running", *sequence, &sink);
     *sequence += 1;
@@ -195,14 +197,7 @@ pub(crate) async fn run_command(
         emitted_at: Utc::now().timestamp(),
     });
     *sequence += 1;
-    emit_progress(
-        task_id,
-        ecosystem,
-        *sequence,
-        TaskStatus::Running,
-        None,
-        &sink,
-    );
+    emit_progress(&progress_task, *sequence, TaskStatus::Running, None, &sink);
     if let Some(database) = &database {
         if !matches!(
             database.update_task(task_id, TaskStatus::Running, None),
@@ -210,8 +205,7 @@ pub(crate) async fn run_command(
         ) {
             *sequence += 1;
             emit_progress(
-                task_id,
-                ecosystem,
+                &progress_task,
                 *sequence,
                 TaskStatus::Failed,
                 Some(TaskErrorKind::Unknown),
@@ -249,13 +243,12 @@ pub(crate) async fn run_command(
         }
     };
     *sequence += 1;
-    emit_progress(task_id, ecosystem, *sequence, status, error, &sink);
+    emit_progress(&progress_task, *sequence, status, error, &sink);
     if let Some(database) = &database {
         if !matches!(database.update_task(task_id, status, error), Ok(true)) {
             *sequence += 1;
             emit_progress(
-                task_id,
-                ecosystem,
+                &progress_task,
                 *sequence,
                 TaskStatus::Failed,
                 Some(TaskErrorKind::Unknown),
@@ -389,9 +382,60 @@ async fn execute_command(
             .await
         }
         WorkerCommand::Update(task) => {
-            let affected_names =
-                update_with_retries(adapter, executor, &task, cancel.clone(), database, task_id)
-                    .await?;
+            let (update_executor, live_sequence) = if ecosystem == Ecosystem::Homebrew {
+                let live_progress =
+                    Arc::new(Mutex::new((HomebrewProgressTracker::default(), *sequence)));
+                let task_for_progress = task.clone();
+                let sink_for_progress = sink.clone();
+                let callback_progress = live_progress.clone();
+                let output_sink: OutputChunkSink = Arc::new(move |chunk| {
+                    let mut state = callback_progress
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let progress = state.0.push(chunk, Instant::now());
+                    if let Some(progress) = progress {
+                        state.1 += 1;
+                        sink_for_progress(WorkerEvent::TaskProgress {
+                            task_id: task_for_progress.task_id,
+                            ecosystem: task_for_progress.ecosystem,
+                            name: task_for_progress.name.clone(),
+                            operation: task_for_progress.operation,
+                            sequence: state.1,
+                            status: TaskStatus::Running,
+                            completed: progress.downloaded_bytes,
+                            total: progress.total_bytes,
+                            eta_seconds: progress.eta_seconds,
+                            message: None,
+                            error: None,
+                            emitted_at: Utc::now().timestamp(),
+                        });
+                    }
+                });
+                (
+                    executor.clone().with_output_chunk_sink(output_sink),
+                    Some(live_progress),
+                )
+            } else {
+                (executor.clone(), None)
+            };
+            let update_result = update_with_retries(
+                adapter,
+                &update_executor,
+                &task,
+                cancel.clone(),
+                database,
+                task_id,
+            )
+            .await;
+            if let Some(live_sequence) = live_sequence {
+                *sequence = (*sequence).max(
+                    live_sequence
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .1,
+                );
+            }
+            let affected_names = update_result?;
             if let Some(database) = database {
                 let mut affected_packages = Vec::new();
                 for name in affected_names {
@@ -911,7 +955,7 @@ fn transition_measure_task(
         }
     }
     *sequence += 1;
-    emit_progress(task.task_id, task.ecosystem, *sequence, status, error, sink);
+    emit_progress(task, *sequence, status, error, sink);
     Ok(())
 }
 
@@ -989,16 +1033,17 @@ fn emit_state(ecosystem: Ecosystem, state: &str, sequence: u64, sink: &WorkerEve
 }
 
 fn emit_progress(
-    task_id: Uuid,
-    ecosystem: Ecosystem,
+    task: &PackageTask,
     sequence: u64,
     status: TaskStatus,
     error: Option<TaskErrorKind>,
     sink: &WorkerEventSink,
 ) {
     sink(WorkerEvent::TaskProgress {
-        task_id,
-        ecosystem,
+        task_id: task.task_id,
+        ecosystem: task.ecosystem,
+        name: task.name.clone(),
+        operation: task.operation,
         sequence,
         status,
         completed: u64::from(matches!(
@@ -1006,6 +1051,7 @@ fn emit_progress(
             TaskStatus::Succeeded | TaskStatus::Failed | TaskStatus::Cancelled
         )),
         total: 1,
+        eta_seconds: None,
         message: None,
         error,
         emitted_at: Utc::now().timestamp(),

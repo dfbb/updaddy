@@ -53,6 +53,18 @@ fn homebrew_cask_and_tap_use_dedicated_commands() {
             .collect::<Vec<_>>(),
         ["untap", "acme/tools"]
     );
+
+    let update = PackageTask::new(Ecosystem::Homebrew, "cask:chatgpt", Operation::Update);
+    let update_spec = HomebrewAdapter::new().plan(&update).unwrap();
+    assert_eq!(
+        update_spec
+            .args
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["upgrade", "--cask", "chatgpt"]
+    );
+    assert!(update_spec.pseudo_terminal);
 }
 
 #[test]

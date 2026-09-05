@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
@@ -129,7 +130,7 @@ impl EcosystemAdapter for HomebrewAdapter {
         let cask_installed = self
             .run(
                 context,
-                command("brew", ["list", "--cask", "--versions"]),
+                command("brew", ["info", "--cask", "--json=v2", "--installed"]),
                 cancel.clone(),
             )
             .await?;
@@ -161,7 +162,7 @@ impl EcosystemAdapter for HomebrewAdapter {
                 update.and_then(|(_, target)| target.clone()),
             ));
         }
-        for (name, current) in installed_versions(&cask_installed.stdout) {
+        for (name, current) in installed_cask_versions(&cask_installed.stdout)? {
             let update = outdated_cask.get(&name);
             records.push(package_record(
                 Ecosystem::Homebrew,
@@ -209,7 +210,10 @@ impl EcosystemAdapter for HomebrewAdapter {
             }
             _ => return Err(TaskErrorKind::InvalidInput),
         };
-        Ok(command("brew", args))
+        let mut spec = command("brew", args);
+        spec.pseudo_terminal = task.operation == crate::core::Operation::Update
+            && matches!(kind, ResourceKind::Formula | ResourceKind::Cask);
+        Ok(spec)
     }
 
     async fn uninstall(
@@ -339,6 +343,161 @@ fn installed_versions(output: &str) -> impl Iterator<Item = (String, Option<Stri
     })
 }
 
+fn installed_cask_versions(output: &str) -> Result<Vec<(String, Option<String>)>, TaskErrorKind> {
+    let root: serde_json::Value =
+        serde_json::from_str(output).map_err(|_| TaskErrorKind::CommandFailed)?;
+    let casks = root
+        .get("casks")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(TaskErrorKind::CommandFailed)?;
+    casks
+        .iter()
+        .map(|cask| {
+            let name = cask
+                .get("token")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(TaskErrorKind::CommandFailed)?;
+            let version = cask
+                .get("installed")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            Ok((name.to_owned(), version))
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HomebrewDownloadProgress {
+    pub downloaded_bytes: u64,
+    pub total_bytes: u64,
+    pub eta_seconds: Option<u64>,
+}
+
+#[derive(Default)]
+pub(crate) struct HomebrewProgressTracker {
+    buffer: String,
+    last_sample: Option<(u64, Instant)>,
+    bytes_per_second: Option<f64>,
+    last_emitted: Option<(u64, u64)>,
+}
+
+impl HomebrewProgressTracker {
+    pub fn push(&mut self, chunk: &[u8], now: Instant) -> Option<HomebrewDownloadProgress> {
+        append_terminal_text(&mut self.buffer, chunk);
+        if self.buffer.len() > 8_192 {
+            self.buffer.drain(..self.buffer.len() - 4_096);
+        }
+        let (downloaded_bytes, total_bytes) = parse_latest_size_pair(&self.buffer)?;
+        if self.last_emitted == Some((downloaded_bytes, total_bytes)) {
+            return None;
+        }
+
+        if let Some((previous_bytes, previous_at)) = self.last_sample {
+            if downloaded_bytes > previous_bytes {
+                let elapsed = now.saturating_duration_since(previous_at).as_secs_f64();
+                if elapsed >= 0.01 {
+                    let current = (downloaded_bytes - previous_bytes) as f64 / elapsed;
+                    self.bytes_per_second = Some(
+                        self.bytes_per_second
+                            .map_or(current, |previous| previous * 0.7 + current * 0.3),
+                    );
+                }
+            } else if downloaded_bytes < previous_bytes {
+                self.bytes_per_second = None;
+            }
+        }
+        self.last_sample = Some((downloaded_bytes, now));
+        self.last_emitted = Some((downloaded_bytes, total_bytes));
+
+        let eta_seconds = self.bytes_per_second.and_then(|speed| {
+            (speed > 1.0 && downloaded_bytes < total_bytes)
+                .then(|| ((total_bytes - downloaded_bytes) as f64 / speed).ceil() as u64)
+        });
+        Some(HomebrewDownloadProgress {
+            downloaded_bytes,
+            total_bytes,
+            eta_seconds,
+        })
+    }
+}
+
+fn append_terminal_text(output: &mut String, chunk: &[u8]) {
+    let mut index = 0;
+    while index < chunk.len() {
+        match chunk[index] {
+            0x1b => {
+                index += 1;
+                if chunk.get(index) == Some(&b'[') {
+                    index += 1;
+                    while index < chunk.len() {
+                        let byte = chunk[index];
+                        index += 1;
+                        if (0x40..=0x7e).contains(&byte) {
+                            break;
+                        }
+                    }
+                }
+            }
+            b'\r' => {
+                output.push('\n');
+                index += 1;
+            }
+            byte if byte == b'\n' || byte.is_ascii_graphic() || byte == b' ' => {
+                output.push(byte as char);
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+}
+
+fn parse_latest_size_pair(output: &str) -> Option<(u64, u64)> {
+    output.match_indices('/').rev().find_map(|(slash, _)| {
+        let left = &output[..slash];
+        let right = &output[slash + 1..];
+        let downloaded = (left.len().saturating_sub(24)..left.len()).find_map(|start| {
+            let candidate = left[start..].trim();
+            parse_size_prefix(candidate)
+                .filter(|(_, consumed)| *consumed == candidate.len())
+                .map(|(bytes, _)| bytes)
+        })?;
+        let (total, _) = parse_size_prefix(right)?;
+        (total > 0 && downloaded <= total).then_some((downloaded, total))
+    })
+}
+
+fn parse_size_prefix(value: &str) -> Option<(u64, usize)> {
+    let bytes = value.as_bytes();
+    let mut index = bytes.iter().position(|byte| !byte.is_ascii_whitespace())?;
+    let number_start = index;
+    while bytes
+        .get(index)
+        .is_some_and(|byte| byte.is_ascii_digit() || *byte == b'.')
+    {
+        index += 1;
+    }
+    if index == number_start {
+        return None;
+    }
+    let number = value[number_start..index].parse::<f64>().ok()?;
+    while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+        index += 1;
+    }
+    let unit_start = index;
+    while bytes.get(index).is_some_and(u8::is_ascii_alphabetic) {
+        index += 1;
+    }
+    let multiplier = match value[unit_start..index].to_ascii_uppercase().as_str() {
+        "B" => 1.0,
+        "KB" => 1_000.0,
+        "MB" => 1_000_000.0,
+        "GB" => 1_000_000_000.0,
+        "TB" => 1_000_000_000_000.0,
+        _ => return None,
+    };
+    Some(((number * multiplier).round() as u64, index))
+}
+
 fn outdated_versions(
     output: &str,
 ) -> std::collections::HashMap<String, (Option<String>, Option<String>)> {
@@ -408,8 +567,12 @@ fn changed_taps(output: &str) -> std::collections::HashSet<String> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::time::{Duration, Instant};
 
-    use super::{changed_taps, outdated_versions, resolve_cask_artifacts};
+    use super::{
+        changed_taps, installed_cask_versions, outdated_versions, resolve_cask_artifacts,
+        HomebrewProgressTracker,
+    };
     use crate::disk_usage::{measure_paths, PackageInstallPaths};
 
     #[test]
@@ -424,6 +587,44 @@ mod tests {
             cask.get("firefox"),
             Some(&(Some("123.0".into()), Some("124.0".into())))
         );
+    }
+
+    #[test]
+    fn parses_installed_casks_without_loading_untrusted_tap_definitions() {
+        let casks = installed_cask_versions(
+            r#"{"formulae":[],"casks":[{"token":"firefox","installed":"124.0"},{"token":"depotdownloader","installed":"3.4.0"}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            casks,
+            vec![
+                ("firefox".into(), Some("124.0".into())),
+                ("depotdownloader".into(), Some("3.4.0".into())),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_homebrew_tty_download_progress_and_estimates_remaining_time() {
+        let started = Instant::now();
+        let mut tracker = HomebrewProgressTracker::default();
+        let first = tracker
+            .push(b"chatgpt  Downloading  10.0MB/100.0MB", started)
+            .unwrap();
+        assert_eq!(first.downloaded_bytes, 10_000_000);
+        assert_eq!(first.total_bytes, 100_000_000);
+        assert_eq!(first.eta_seconds, None);
+
+        let second = tracker
+            .push(
+                b"\x1b[0Gchatgpt  Downloading  30.0MB/100.0MB",
+                started + Duration::from_secs(2),
+            )
+            .unwrap();
+        assert_eq!(second.downloaded_bytes, 30_000_000);
+        assert_eq!(second.total_bytes, 100_000_000);
+        assert_eq!(second.eta_seconds, Some(7));
     }
 
     #[test]

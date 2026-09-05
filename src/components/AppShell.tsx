@@ -64,7 +64,7 @@ export default function AppShell({ activePage, activeEcosystem, onNavigate, chil
           </button>
           {operationsDisabled && <p className="nav-status">{t("navigation.operation_in_progress")}</p>}
         </nav>
-        <main className="app-content">{children}</main>
+        <main className={`app-content ${activePage === "ecosystem" ? "app-content-ecosystem" : ""}`}>{children}</main>
       </div>
     </div>
   );
