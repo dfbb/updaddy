@@ -7,8 +7,8 @@ import ConfirmUninstallDialog from "./ConfirmUninstallDialog";
 import EmptyState from "./EmptyState";
 import StatusBadge, { packageStatus } from "./StatusBadge";
 
-type SortMode = "default" | "disk";
-type DiskDirection = "asc" | "desc";
+type SortMode = "default" | "name" | "status" | "disk";
+type SortDirection = "asc" | "desc";
 
 export interface PackageInput extends Partial<PackageRecord> {
   id: string;
@@ -84,7 +84,7 @@ export default function PackageTable({
 }: PackageTableProps) {
   const { t } = useI18n();
   const [sortMode, setSortMode] = useState<SortMode>("default");
-  const [diskDirection, setDiskDirection] = useState<DiskDirection>("desc");
+  const [sortDirection, setSortDirection] = useState<SortDirection>("desc");
   const [pendingUninstall, setPendingUninstall] = useState<PackageRecord | null>(null);
   const active = useMemo(() => new Set(activeTaskIds), [activeTaskIds]);
   const normalizedPackages = useMemo(() => packages.map(normalizePackageRecord), [packages]);
@@ -92,27 +92,31 @@ export default function PackageTable({
   const sortedPackages = useMemo(() => {
     const filtered = ecosystem ? normalizedPackages.filter((item) => item.ecosystem === ecosystem) : normalizedPackages;
     return [...filtered].sort((a, b) => {
+      const nameComparison = a.name.localeCompare(b.name, undefined, { sensitivity: "base" });
       if (sortMode === "disk") {
         const left = diskBytes(a) ?? -1;
         const right = diskBytes(b) ?? -1;
-        if (left !== right) return diskDirection === "asc" ? left - right : right - left;
-      } else if (a.update_available !== b.update_available) {
+        if (left !== right) return sortDirection === "asc" ? left - right : right - left;
+      } else if (sortMode === "name") {
+        return sortDirection === "asc" ? nameComparison : -nameComparison;
+      } else if (sortMode === "status" && a.update_available !== b.update_available) {
+        const comparison = Number(a.update_available) - Number(b.update_available);
+        return sortDirection === "asc" ? comparison : -comparison;
+      } else if (sortMode === "default" && a.update_available !== b.update_available) {
         return a.update_available ? -1 : 1;
       }
-      return a.name.localeCompare(b.name, undefined, { sensitivity: "base" });
+      return nameComparison;
     });
-  }, [diskDirection, ecosystem, normalizedPackages, sortMode]);
+  }, [ecosystem, normalizedPackages, sortDirection, sortMode]);
 
-  const handleDiskSort = () => {
-    if (sortMode === "disk") {
-      setDiskDirection((direction) => (direction === "desc" ? "asc" : "desc"));
+  const changeSort = (nextMode: Exclude<SortMode, "default">, initialDirection: SortDirection) => {
+    if (sortMode === nextMode) {
+      setSortDirection((direction) => (direction === "desc" ? "asc" : "desc"));
     } else {
-      setSortMode("disk");
-      setDiskDirection("desc");
+      setSortMode(nextMode);
+      setSortDirection(initialDirection);
     }
   };
-
-  const resetSort = () => setSortMode("default");
   const update = onUpdate ?? ((item: PackageRecord) => updatePackage({ ecosystem: item.ecosystem, name: item.name }));
   const uninstall = onUninstall ?? ((item: PackageRecord) => uninstallPackage({ ecosystem: item.ecosystem, name: item.name }));
 
@@ -125,20 +129,26 @@ export default function PackageTable({
           <caption className="sr-only">{t("package.table_caption")}</caption>
           <thead>
             <tr>
-              <th scope="col">
-                <button type="button" className="table-sort-button" onClick={resetSort}>
+              <th scope="col" aria-sort={sortMode === "name" ? (sortDirection === "asc" ? "ascending" : "descending") : "none"}>
+                <button type="button" className="table-sort-button" onClick={() => changeSort("name", "asc")}>
                   {t("package.name")}
+                  {sortMode === "name" && (sortDirection === "asc" ? <ArrowUp size={13} aria-hidden="true" /> : <ArrowDown size={13} aria-hidden="true" />)}
                 </button>
               </th>
               <th scope="col">{t("package.current_version")}</th>
               <th scope="col">{t("package.target_version")}</th>
-              <th scope="col" aria-sort={sortMode === "disk" ? (diskDirection === "asc" ? "ascending" : "descending") : "none"}>
-                <button type="button" className="table-sort-button" onClick={handleDiskSort}>
+              <th scope="col" aria-sort={sortMode === "disk" ? (sortDirection === "asc" ? "ascending" : "descending") : "none"}>
+                <button type="button" className="table-sort-button" onClick={() => changeSort("disk", "desc")}>
                   {t("package.disk_usage")}
-                  {sortMode === "disk" && (diskDirection === "asc" ? <ArrowUp size={13} aria-hidden="true" /> : <ArrowDown size={13} aria-hidden="true" />)}
+                  {sortMode === "disk" && (sortDirection === "asc" ? <ArrowUp size={13} aria-hidden="true" /> : <ArrowDown size={13} aria-hidden="true" />)}
                 </button>
               </th>
-              <th scope="col">{t("package.status")}</th>
+              <th scope="col" aria-sort={sortMode === "status" ? (sortDirection === "asc" ? "ascending" : "descending") : "none"}>
+                <button type="button" className="table-sort-button" onClick={() => changeSort("status", "desc")}>
+                  {t("package.status")}
+                  {sortMode === "status" && (sortDirection === "asc" ? <ArrowUp size={13} aria-hidden="true" /> : <ArrowDown size={13} aria-hidden="true" />)}
+                </button>
+              </th>
               <th scope="col">{t("package.actions")}</th>
             </tr>
           </thead>

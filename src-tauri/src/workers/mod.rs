@@ -36,6 +36,7 @@ pub enum WorkerEvent {
         completed: u64,
         total: u64,
         eta_seconds: Option<u64>,
+        phase: Option<String>,
         message: Option<String>,
         error: Option<TaskErrorKind>,
         emitted_at: i64,
@@ -45,6 +46,13 @@ pub enum WorkerEvent {
         ecosystem: Ecosystem,
         sequence: u64,
         package: PackageRecord,
+        emitted_at: i64,
+    },
+    PackageRemoved {
+        task_id: Uuid,
+        ecosystem: Ecosystem,
+        sequence: u64,
+        package_id: String,
         emitted_at: i64,
     },
     DiskUsage {

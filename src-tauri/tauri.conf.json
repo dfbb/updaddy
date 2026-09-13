@@ -24,6 +24,9 @@
   "bundle": {
     "active": true,
     "targets": ["app", "dmg"],
-    "icon": ["icons/icon.icns"]
+    "icon": ["icons/icon.icns"],
+    "resources": {
+      "resources/updaddy-askpass": "updaddy-askpass"
+    }
   }
 }

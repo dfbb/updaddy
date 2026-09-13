@@ -347,11 +347,25 @@ impl Database {
         Ok(())
     }
 
-    pub fn mark_running_tasks_interrupted(&self) -> Result<u64> {
+    pub fn append_task_log(&self, task_id: Uuid, entry: &LogEntry) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO log_entries(message,emitted_at,stream,task_id) VALUES (?1,?2,?3,?4)",
+            params![
+                entry.message,
+                entry.emitted_at,
+                entry.stream,
+                task_id.to_string()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_active_tasks_interrupted(&self) -> Result<u64> {
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
         let changed = tx.execute(
-            "UPDATE package_tasks SET status='interrupted' WHERE status='running'",
+            "UPDATE package_tasks SET status='interrupted' WHERE status IN ('pending','running')",
             [],
         )? as u64;
         tx.commit()?;
@@ -519,6 +533,23 @@ impl Database {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(entries)
     }
+
+    pub fn list_task_logs(&self, task_id: Uuid) -> Result<Vec<LogEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT message, emitted_at, stream FROM log_entries WHERE task_id = ?1 ORDER BY id",
+        )?;
+        let entries = stmt
+            .query_map(params![task_id.to_string()], |row| {
+                Ok(LogEntry {
+                    message: row.get(0)?,
+                    emitted_at: row.get(1)?,
+                    stream: row.get(2)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(entries)
+    }
 }
 
 fn insert_task(tx: &rusqlite::Transaction<'_>, batch_id: Uuid, task: &PackageTask) -> Result<()> {
@@ -575,6 +606,58 @@ mod tests {
         let attempts = db.list_task_attempts(task_id).unwrap();
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].finished_at, Some(20));
+    }
+
+    #[test]
+    fn startup_marks_pending_and_running_tasks_interrupted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("startup.sqlite")).unwrap();
+        let mut pending = PackageTask::new(Ecosystem::Npm, "pending", Operation::Update);
+        let pending_id = pending.task_id;
+        let mut running = PackageTask::new(Ecosystem::Npm, "running", Operation::Update);
+        running.status = crate::core::TaskStatus::Running;
+        let running_id = running.task_id;
+        pending.status = crate::core::TaskStatus::Pending;
+        db.create_batch(&OperationBatch {
+            batch_id: Uuid::new_v4(),
+            ecosystem: Ecosystem::Npm,
+            tasks: vec![pending, running],
+            created_at: 1,
+        })
+        .unwrap();
+
+        assert_eq!(db.mark_active_tasks_interrupted().unwrap(), 2);
+        let tasks = db.list_tasks().unwrap();
+        assert!(tasks
+            .iter()
+            .filter(|task| task.task_id == pending_id || task.task_id == running_id)
+            .all(|task| task.status == crate::core::TaskStatus::Interrupted));
+    }
+
+    #[test]
+    fn task_logs_are_scoped_to_the_requested_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("task-logs.sqlite")).unwrap();
+        let first = PackageTask::new(Ecosystem::Npm, "eslint", Operation::Update);
+        let first_id = first.task_id;
+        let second = PackageTask::new(Ecosystem::Npm, "typescript", Operation::Update);
+        let second_id = second.task_id;
+        db.create_batch(&OperationBatch {
+            batch_id: Uuid::new_v4(),
+            ecosystem: Ecosystem::Npm,
+            tasks: vec![first, second],
+            created_at: 1_700_000_000,
+        })
+        .unwrap();
+        db.append_task_log(first_id, &LogEntry::at("first error", 10))
+            .unwrap();
+        db.append_task_log(second_id, &LogEntry::at("second error", 11))
+            .unwrap();
+
+        assert_eq!(
+            db.list_task_logs(first_id).unwrap(),
+            vec![LogEntry::at("first error", 10)]
+        );
     }
 
     #[test]

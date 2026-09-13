@@ -63,9 +63,14 @@ struct Envelope {
     cancel: CancellationToken,
 }
 
+struct ActiveTask {
+    ecosystem: Ecosystem,
+    cancel: CancellationToken,
+}
+
 pub struct WorkerSupervisor {
     senders: HashMap<Ecosystem, mpsc::Sender<Envelope>>,
-    cancellations: Arc<Mutex<HashMap<Uuid, CancellationToken>>>,
+    cancellations: Arc<Mutex<HashMap<Uuid, ActiveTask>>>,
     handles: Mutex<Vec<JoinHandle<()>>>,
     database: Option<Arc<Database>>,
     batch_gate: Mutex<()>,
@@ -147,6 +152,7 @@ impl WorkerSupervisor {
                                 completed: 1,
                                 total: 1,
                                 eta_seconds: None,
+                                phase: None,
                                 message: Some(
                                     match update {
                                         Ok(false) => "database task missing",
@@ -172,6 +178,7 @@ impl WorkerSupervisor {
                                 completed: 1,
                                 total: 1,
                                 eta_seconds: None,
+                                phase: None,
                                 message: None,
                                 error: None,
                                 emitted_at: chrono::Utc::now().timestamp(),
@@ -215,6 +222,7 @@ impl WorkerSupervisor {
                             completed: 1,
                             total: 1,
                             eta_seconds: None,
+                            phase: None,
                             message: Some("worker panicked".into()),
                             error: Some(crate::core::TaskErrorKind::Unknown),
                             emitted_at: chrono::Utc::now().timestamp(),
@@ -264,7 +272,7 @@ impl WorkerSupervisor {
             .unwrap_or_else(|p| p.into_inner())
             .values()
         {
-            token.cancel();
+            token.cancel.cancel();
         }
         if let Some(database) = &self.database {
             for task_id in active_ids {
@@ -288,7 +296,17 @@ impl WorkerSupervisor {
     /// 从而在手动批次运行时等待，而不会重复创建任务。
     pub fn submit_batch(&self, commands: Vec<WorkerCommand>) -> Result<Vec<Uuid>> {
         let _guard = self.batch_gate.lock().unwrap_or_else(|p| p.into_inner());
-        if self.active_task_count() > 0 {
+        let ecosystems = commands
+            .iter()
+            .filter_map(|command| command.ecosystem())
+            .collect::<std::collections::HashSet<_>>();
+        if self
+            .cancellations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .any(|task| ecosystems.contains(&task.ecosystem))
+        {
             return Err(SupervisorError::BatchInProgress);
         }
         let mut ids = Vec::new();
@@ -335,7 +353,13 @@ impl WorkerSupervisor {
             if active.contains_key(&id) {
                 return Err(SupervisorError::DuplicateTask(id));
             }
-            active.insert(id, cancel.clone());
+            active.insert(
+                id,
+                ActiveTask {
+                    ecosystem,
+                    cancel: cancel.clone(),
+                },
+            );
         }
         let sender = self
             .senders
@@ -382,14 +406,21 @@ impl WorkerSupervisor {
     }
 
     pub fn cancel(&self, task_id: Uuid) -> Result<()> {
-        let token = self
-            .cancellations
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(&task_id)
-            .cloned()
-            .ok_or(SupervisorError::UnknownTask(task_id))?;
-        token.cancel();
+        let tokens = {
+            let active = self.cancellations.lock().unwrap_or_else(|p| p.into_inner());
+            let ecosystem = active
+                .get(&task_id)
+                .map(|task| task.ecosystem)
+                .ok_or(SupervisorError::UnknownTask(task_id))?;
+            active
+                .values()
+                .filter(|task| task.ecosystem == ecosystem)
+                .map(|task| task.cancel.clone())
+                .collect::<Vec<_>>()
+        };
+        for token in tokens {
+            token.cancel();
+        }
         Ok(())
     }
 
@@ -646,6 +677,52 @@ mod tests {
     }
 
     #[test]
+    fn batch_conflicts_are_scoped_to_the_same_ecosystem() {
+        let events = TestEvents {
+            state: Arc::new((Mutex::new(Vec::new()), std::sync::Condvar::new())),
+            release: Arc::new(AtomicBool::new(false)),
+        };
+        let mut adapters = HashMap::new();
+        for ecosystem in [Ecosystem::Homebrew, Ecosystem::Pip] {
+            adapters.insert(
+                ecosystem,
+                Arc::new(DelayedAdapter {
+                    release: events.release.clone(),
+                }) as Arc<dyn EcosystemAdapter>,
+            );
+        }
+        let supervisor = WorkerSupervisor::start(SupervisorContext {
+            adapters,
+            database: None,
+            event_sink: events.sink(),
+            executor: crate::adapters::ExecutorContext::new(),
+            detect_on_start: false,
+        });
+        let pip = supervisor
+            .submit(WorkerCommand::Scan(Ecosystem::Pip))
+            .unwrap();
+        events.wait_for_running(pip);
+
+        let homebrew = supervisor
+            .submit_batch(vec![WorkerCommand::Update(package_task(
+                Ecosystem::Homebrew,
+                "demo",
+            ))])
+            .unwrap();
+        assert!(matches!(
+            supervisor.submit_batch(vec![WorkerCommand::Update(package_task(
+                Ecosystem::Pip,
+                "other",
+            ))]),
+            Err(SupervisorError::BatchInProgress)
+        ));
+        events.wait_for_running(homebrew[0]);
+        events.release_first_task();
+        events.wait_for_completed(pip);
+        events.wait_for_completed(homebrew[0]);
+    }
+
+    #[test]
     fn cancellation_marks_running_task_cancelled_without_retry() {
         let events = TestEvents {
             state: Arc::new((Mutex::new(Vec::new()), std::sync::Condvar::new())),
@@ -675,5 +752,42 @@ mod tests {
         supervisor.cancel(task).unwrap();
         events.wait_for_status(task, TaskStatus::Cancelled);
         assert!(!events.has_status(task, TaskStatus::Succeeded));
+    }
+
+    #[test]
+    fn cancelling_one_task_cancels_the_ecosystem_queue() {
+        let events = TestEvents {
+            state: Arc::new((Mutex::new(Vec::new()), std::sync::Condvar::new())),
+            release: Arc::new(AtomicBool::new(false)),
+        };
+        let mut adapters = HashMap::new();
+        adapters.insert(
+            Ecosystem::Gem,
+            Arc::new(DelayedAdapter {
+                release: events.release.clone(),
+            }) as Arc<dyn EcosystemAdapter>,
+        );
+        let supervisor = WorkerSupervisor::start(SupervisorContext {
+            adapters,
+            database: None,
+            event_sink: events.sink(),
+            executor: crate::adapters::ExecutorContext::new(),
+            detect_on_start: false,
+        });
+        let first = supervisor
+            .submit(WorkerCommand::Update(package_task(Ecosystem::Gem, "first")))
+            .unwrap();
+        let second = supervisor
+            .submit(WorkerCommand::Update(package_task(
+                Ecosystem::Gem,
+                "second",
+            )))
+            .unwrap();
+        events.wait_for_running(first);
+
+        supervisor.cancel(first).unwrap();
+
+        events.wait_for_status(first, TaskStatus::Cancelled);
+        events.wait_for_status(second, TaskStatus::Cancelled);
     }
 }

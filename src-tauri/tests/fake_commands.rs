@@ -42,6 +42,9 @@ fn homebrew_cask_and_tap_use_dedicated_commands() {
             .collect::<Vec<_>>(),
         ["uninstall", "--cask", "firefox"]
     );
+    let uninstall_spec = HomebrewAdapter::new().plan(&cask).unwrap();
+    let askpass = uninstall_spec.env.get("SUDO_ASKPASS").unwrap();
+    assert!(std::path::Path::new(askpass).is_file());
     let tap = PackageTask::new(Ecosystem::Homebrew, "tap:acme/tools", Operation::Uninstall);
     assert_eq!(
         HomebrewAdapter::new()
@@ -62,7 +65,7 @@ fn homebrew_cask_and_tap_use_dedicated_commands() {
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>(),
-        ["upgrade", "--cask", "chatgpt"]
+        ["upgrade", "--yes", "--cask", "chatgpt"]
     );
     assert!(update_spec.pseudo_terminal);
 }

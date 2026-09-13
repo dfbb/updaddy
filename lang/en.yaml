@@ -23,6 +23,10 @@ task:
   cancelled: Cancelled
   interrupted: Interrupted
   cancel: Cancel
+  view_log: View log
+  close_log: Close
+  no_live_logs: No live logs yet
+  cancel_failed: "Could not cancel the task: {error}"
   progress_label: Task progress
   ecosystem_scan: ecosystem scan
   scan_detail: Reading installed packages and disk usage
@@ -31,6 +35,8 @@ task:
   measure_disk_detail: Calculating disk usage for {name}
   download_detail: "{downloaded} / {total} ({percent}%) · about {eta} remaining"
   download_detail_no_eta: "{downloaded} / {total} ({percent}%)"
+  download_detail_unknown_total: "{downloaded} downloaded · total size not reported by Homebrew"
+  homebrew_processing_detail: "Homebrew is continuing downloads, verification, or installation for {name}"
 worker:
   idle: Ready
 operations:
@@ -151,8 +157,8 @@ history:
   period_month: Last 30 days
   batches: Batches
   batch_summary: "{total} tasks · {succeeded} succeeded · {failed} failed · {cancelled} cancelled"
-  attempts: Attempts
-  no_attempts: No recorded attempts.
+  logs: Logs
+  no_logs: No command output was recorded for this task.
   no_tasks: No tasks match the selected filters.
   retry: Retry
   coming_soon: History is coming soon

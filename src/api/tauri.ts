@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { BackendEvent, Ecosystem, PackageRecord, Settings, StateSnapshot, TaskAttempt } from "../types";
+import type { BackendEvent, Ecosystem, LogEntry, PackageRecord, Settings, StateSnapshot } from "../types";
 export const invokeTask = (command: string, payload?: Record<string, unknown>) => invoke<string | string[]>(command, payload);
 export const getStateSnapshot = () => invoke<StateSnapshot>("get_state_snapshot");
 export const getSettings = () => invoke<Settings>("get_settings");
@@ -11,13 +11,14 @@ export const scanAllVisible = () => invoke<string[]>("scan_all_visible");
 export const updatePackage = (packageRecord: Pick<PackageRecord, "ecosystem" | "name">) => invoke<string>("update_package", { package: packageRecord });
 export const uninstallPackage = (packageRecord: Pick<PackageRecord, "ecosystem" | "name">) => invoke<string>("uninstall_package", { package: packageRecord });
 export const updateAllVisible = () => invoke<string[]>("update_all_visible");
+export const updateEcosystem = (ecosystem: Ecosystem) => invoke<string[]>("update_ecosystem", { ecosystem });
 export const refreshDiskUsage = (packageRecord: PackageRecord) => invoke<string>("refresh_disk_usage", { package: packageRecord });
 export const setLoginItem = (enabled: boolean) => invoke<void>("set_login_item", { enabled });
 export const cleanupExpiredLogs = () => invoke<number>("cleanup_expired_logs");
 export const retryTask = (taskId: string) => invoke<string>("retry_task", { taskId });
-export const listTaskAttempts = (taskId: string) => invoke<TaskAttempt[]>("list_task_attempts", { taskId });
+export const listTaskLogs = (taskId: string) => invoke<LogEntry[]>("list_task_logs", { taskId });
 export async function subscribeToBackendEvents(onEvent: (name: string, payload: BackendEvent) => void): Promise<UnlistenFn[]> {
-  const names = ["worker-state", "task-progress", "package-changed", "disk-usage", "log-entry", "batch-summary"];
+  const names = ["worker-state", "task-progress", "package-changed", "package-removed", "disk-usage", "log-entry", "batch-summary"];
   const last = new Map<string, number>();
   return Promise.all(names.map((name) => listen<BackendEvent>(name, ({ payload }) => {
     // Log entries do not carry an ecosystem sequence; retain every entry in arrival order.

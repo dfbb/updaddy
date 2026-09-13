@@ -8,7 +8,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::adapters::{ExecutorContext, HomebrewProgressTracker};
+use crate::adapters::{ExecutorContext, HomebrewProgressPhase, HomebrewProgressTracker};
 use crate::core::{
     DiskUsage, DiskUsageStatus, Ecosystem, Operation, PackageRecord, PackageTask, TaskErrorKind,
     TaskStatus,
@@ -217,6 +217,7 @@ pub(crate) async fn run_command(
         }
     }
 
+    let task_executor = executor.with_task_id(task_id);
     let result = if cancel.is_cancelled() {
         Err(TaskErrorKind::CommandFailed)
     } else {
@@ -225,7 +226,7 @@ pub(crate) async fn run_command(
             task_id,
             command,
             adapter.as_ref(),
-            &executor,
+            &task_executor,
             cancel.clone(),
             database.as_ref(),
             sequence,
@@ -395,6 +396,23 @@ async fn execute_command(
                     let progress = state.0.push(chunk, Instant::now());
                     if let Some(progress) = progress {
                         state.1 += 1;
+                        let (completed, total, eta_seconds, phase) = match progress.phase {
+                            HomebrewProgressPhase::Downloading => (
+                                progress.downloaded_bytes,
+                                progress.total_bytes,
+                                progress.eta_seconds,
+                                None,
+                            ),
+                            HomebrewProgressPhase::DownloadingUnknownTotal => (
+                                progress.downloaded_bytes,
+                                0,
+                                None,
+                                Some("downloading-unknown-total".to_owned()),
+                            ),
+                            HomebrewProgressPhase::Processing => {
+                                (0, 0, None, Some("processing".to_owned()))
+                            }
+                        };
                         sink_for_progress(WorkerEvent::TaskProgress {
                             task_id: task_for_progress.task_id,
                             ecosystem: task_for_progress.ecosystem,
@@ -402,9 +420,10 @@ async fn execute_command(
                             operation: task_for_progress.operation,
                             sequence: state.1,
                             status: TaskStatus::Running,
-                            completed: progress.downloaded_bytes,
-                            total: progress.total_bytes,
-                            eta_seconds: progress.eta_seconds,
+                            completed,
+                            total,
+                            eta_seconds,
+                            phase,
                             message: None,
                             error: None,
                             emitted_at: Utc::now().timestamp(),
@@ -436,6 +455,12 @@ async fn execute_command(
                 );
             }
             let affected_names = update_result?;
+            if ecosystem == Ecosystem::Homebrew
+                && database.is_some()
+                && !task.name.starts_with("tap:")
+            {
+                verify_homebrew_update(adapter, executor, &task, cancel.clone()).await?;
+            }
             if let Some(database) = database {
                 let mut affected_packages = Vec::new();
                 for name in affected_names {
@@ -566,6 +591,14 @@ async fn execute_command(
                     database
                         .delete_snapshot_and_disk_usage(ecosystem, &package.id)
                         .map_err(|_| TaskErrorKind::Unknown)?;
+                    *sequence += 1;
+                    sink(WorkerEvent::PackageRemoved {
+                        task_id,
+                        ecosystem,
+                        sequence: *sequence,
+                        package_id: package.id,
+                        emitted_at: Utc::now().timestamp(),
+                    });
                 }
             }
             Ok(())
@@ -573,6 +606,31 @@ async fn execute_command(
         WorkerCommand::Retry(_) => unreachable!("retry command is resolved by the preflight scan"),
         WorkerCommand::Shutdown => Ok(()),
     }
+}
+
+async fn verify_homebrew_update(
+    adapter: &dyn EcosystemAdapter,
+    executor: &ExecutorContext,
+    task: &PackageTask,
+    cancel: CancellationToken,
+) -> Result<(), TaskErrorKind> {
+    let packages = adapter
+        .scan_with_cancel(executor, cancel)
+        .await
+        .map_err(|error| {
+            if error == TaskErrorKind::CommandFailed {
+                TaskErrorKind::CommandFailed
+            } else {
+                error
+            }
+        })?;
+    let package = packages
+        .into_iter()
+        .find(|package| package.name == task.name);
+    if package.is_none_or(|package| package.update_available) {
+        return Err(TaskErrorKind::CommandFailed);
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1052,6 +1110,7 @@ fn emit_progress(
         )),
         total: 1,
         eta_seconds: None,
+        phase: None,
         message: None,
         error,
         emitted_at: Utc::now().timestamp(),

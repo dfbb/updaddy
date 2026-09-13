@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
-import { RefreshCw } from "lucide-react";
-import { scanEcosystem } from "../api/tauri";
+import { CircleArrowUp, RefreshCw } from "lucide-react";
+import { scanEcosystem, updateEcosystem } from "../api/tauri";
 import type { Ecosystem, PackageRecord, PackageTask } from "../types";
 import { useI18n } from "../i18n/useI18n";
 import { useAppStore } from "../state/appStore";
@@ -18,6 +18,7 @@ export interface EcosystemTabsProps {
   operationsDisabled?: boolean;
   onSelect?: (ecosystem: Ecosystem) => void;
   onScan?: (ecosystem: Ecosystem) => void | Promise<void>;
+  onUpdateAll?: (ecosystem: Ecosystem) => void | Promise<void>;
   onCancel?: (taskId: string) => void | Promise<void>;
 }
 
@@ -38,6 +39,7 @@ export default function EcosystemTabs({
   operationsDisabled: suppliedDisabled,
   onSelect,
   onScan,
+  onUpdateAll,
   onCancel,
 }: EcosystemTabsProps) {
   const { t } = useI18n();
@@ -46,7 +48,6 @@ export default function EcosystemTabs({
   const visibleEcosystems = suppliedVisible ?? state.visibleEcosystems;
   const workers = suppliedWorkers ?? state.workers;
   const tasks = suppliedTasks ?? state.tasks;
-  const operationsDisabled = suppliedDisabled ?? state.operationsDisabled;
   const available = useMemo(() => ecosystems.filter((ecosystem) => visibleEcosystems.includes(ecosystem) && isAvailable(workers[ecosystem])), [visibleEcosystems, workers]);
   const [internalSelected, setInternalSelected] = useState<Ecosystem | undefined>(selected ?? available[0]);
   const current = selected && available.includes(selected) ? selected : (internalSelected && available.includes(internalSelected) ? internalSelected : available[0]);
@@ -55,11 +56,17 @@ export default function EcosystemTabs({
     onSelect?.(ecosystem);
   };
   const scan = onScan ?? ((ecosystem: Ecosystem) => scanEcosystem(ecosystem));
+  const updateAll = onUpdateAll ?? ((ecosystem: Ecosystem) => updateEcosystem(ecosystem));
 
   if (available.length === 0) return <EmptyState title={t("empty.no_ecosystems")} description={t("empty.no_ecosystems_description")} />;
 
   const currentTasks = current ? tasks.filter((task) => task.ecosystem === current) : [];
   const currentPackages = current ? packages.filter((item) => item.ecosystem === current) : [];
+  const currentUpdateCount = currentPackages.filter((item) => item.update_available).length;
+  const operationsDisabled = suppliedDisabled ?? (
+    currentTasks.some((task) => task.status === "pending" || task.status === "running")
+    || (current ? ["running", "scanning", "updating", "uninstalling"].includes((workers[current] ?? "").toLowerCase()) : false)
+  );
 
   return (
     <section className="ecosystem-tabs" aria-label={t("navigation.ecosystems")}>
@@ -91,11 +98,16 @@ export default function EcosystemTabs({
               <p className="eyebrow">{t("ecosystem.eyebrow")}</p>
               <h2>{t(`ecosystems.${current}`)}</h2>
             </div>
-            <button type="button" className="button button-secondary" disabled={operationsDisabled} onClick={() => void scan(current)}>
-              <RefreshCw size={16} aria-hidden="true" />{t("buttons.scan")}
-            </button>
+            <div className="panel-actions">
+              <button type="button" className="button button-primary" disabled={operationsDisabled || currentUpdateCount === 0} onClick={() => void updateAll(current)}>
+                <CircleArrowUp size={16} aria-hidden="true" />{t("buttons.update_all")}
+              </button>
+              <button type="button" className="button button-secondary" disabled={operationsDisabled} onClick={() => void scan(current)}>
+                <RefreshCw size={16} aria-hidden="true" />{t("buttons.scan")}
+              </button>
+            </div>
           </div>
-          <TaskProgressBar ecosystem={current} tasks={currentTasks} onCancel={onCancel} />
+          <TaskProgressBar ecosystem={current} tasks={currentTasks} logs={state.logs} onCancel={onCancel} />
           <PackageTable packages={currentPackages} ecosystem={current} disabled={operationsDisabled} activeTaskIds={currentTasks.filter((task) => task.status === "pending" || task.status === "running").map((task) => task.task_id)} activeTasks={currentTasks} />
         </div>
       )}

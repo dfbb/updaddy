@@ -39,6 +39,32 @@ describe("PackageTable", () => {
     expect(screen.getAllByRole("row")[1]).toHaveTextContent("b");
   });
 
+  it("点击名称后按字母排序并可切换方向", async () => {
+    const user = userEvent.setup();
+    render(<PackageTable packages={[
+      packageRecord({ id: "npm:z", name: "zulu", update_available: true }),
+      packageRecord({ id: "npm:a", name: "alpha" }),
+    ]} />);
+
+    await user.click(screen.getByRole("button", { name: /name|名称/i }));
+    expect(screen.getAllByRole("row")[1]).toHaveTextContent("alpha");
+    await user.click(screen.getByRole("button", { name: /name|名称/i }));
+    expect(screen.getAllByRole("row")[1]).toHaveTextContent("zulu");
+  });
+
+  it("点击状态后按有更新优先排序并可切换方向", async () => {
+    const user = userEvent.setup();
+    render(<PackageTable packages={[
+      packageRecord({ id: "npm:a", name: "alpha" }),
+      packageRecord({ id: "npm:z", name: "zulu", update_available: true }),
+    ]} />);
+
+    await user.click(screen.getByRole("button", { name: /status|状态/i }));
+    expect(screen.getAllByRole("row")[1]).toHaveTextContent("zulu");
+    await user.click(screen.getByRole("button", { name: /status|状态/i }));
+    expect(screen.getAllByRole("row")[1]).toHaveTextContent("alpha");
+  });
+
   it("兼容后端 snake_case 与列表测试常用的 camelCase 磁盘字段", () => {
     render(<PackageTable packages={[{ id: "npm:camel", name: "camel", updateAvailable: true, diskBytes: 4096 }]} />);
     expect(screen.getByText("4 KB")).toBeInTheDocument();

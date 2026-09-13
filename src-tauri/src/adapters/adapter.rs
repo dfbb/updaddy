@@ -5,6 +5,7 @@ use std::sync::RwLock;
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::core::{Ecosystem, PackageRecord, PackageTask, ResourceKind, TaskErrorKind};
 use crate::disk_usage::{resolve_package_paths, PackageInstallPaths};
@@ -54,6 +55,7 @@ pub struct ExecutorContext {
     runner: Arc<dyn CommandRunner>,
     proxy_runtime: Arc<RwLock<Option<Arc<ProxyRuntime>>>>,
     output_chunk_sink: Option<OutputChunkSink>,
+    task_id: Option<Uuid>,
 }
 
 pub fn home_dir() -> PathBuf {
@@ -73,6 +75,19 @@ pub fn home_path(path: impl AsRef<Path>) -> PathBuf {
     }
 }
 
+pub(crate) fn askpass_path() -> Option<PathBuf> {
+    let bundled = std::env::current_exe()
+        .ok()?
+        .parent()?
+        .parent()?
+        .join("Resources/updaddy-askpass");
+    if bundled.is_file() {
+        return Some(bundled);
+    }
+    let development = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/updaddy-askpass");
+    development.is_file().then_some(development)
+}
+
 impl Default for ExecutorContext {
     fn default() -> Self {
         Self::new()
@@ -86,6 +101,7 @@ impl ExecutorContext {
             runner: Arc::new(ProcessCommandRunner::default()),
             proxy_runtime: Arc::new(RwLock::new(None)),
             output_chunk_sink: None,
+            task_id: None,
         }
     }
 
@@ -95,6 +111,7 @@ impl ExecutorContext {
             runner,
             proxy_runtime: Arc::new(RwLock::new(None)),
             output_chunk_sink: None,
+            task_id: None,
         }
     }
 
@@ -104,6 +121,7 @@ impl ExecutorContext {
             runner: Arc::new(ProcessCommandRunner { output_sink }),
             proxy_runtime: Arc::new(RwLock::new(None)),
             output_chunk_sink: None,
+            task_id: None,
         }
     }
 
@@ -114,6 +132,11 @@ impl ExecutorContext {
 
     pub fn with_output_chunk_sink(mut self, sink: OutputChunkSink) -> Self {
         self.output_chunk_sink = Some(sink);
+        self
+    }
+
+    pub fn with_task_id(mut self, task_id: Uuid) -> Self {
+        self.task_id = Some(task_id);
         self
     }
 
@@ -201,6 +224,9 @@ impl ExecutorContext {
         if spec.output_chunk_sink.is_none() {
             spec.output_chunk_sink = self.output_chunk_sink.clone();
         }
+        if spec.task_id.is_none() {
+            spec.task_id = self.task_id;
+        }
         for key in [
             "NPM_CONFIG_PREFIX",
             "GEM_HOME",
@@ -226,7 +252,7 @@ fn proxy_capability_for_program(program: &str) -> ProxyCapability {
         .unwrap_or(program)
     {
         // These tools consume HTTP(S)_PROXY but do not consistently consume SOCKS5 URLs.
-        "brew" | "npm" | "python" | "python3" | "gem" => ProxyCapability::HttpOnly,
+        "brew" | "npm" | "python" | "python3" | "gem" | "ruby" => ProxyCapability::HttpOnly,
         "rustup" => ProxyCapability::NativeSocks5,
         _ => ProxyCapability::Unsupported,
     }
@@ -544,8 +570,21 @@ pub fn classify_command_error(result: &CommandResult) -> TaskErrorKind {
     if http_5xx {
         return TaskErrorKind::HttpServerTemporaryError;
     }
-    if text.contains("permission denied") || text.contains("eacces") {
+    if text.contains("permission denied")
+        || text.contains("eacces")
+        || text.contains("sudo: no password was provided")
+        || text.contains("sudo: a password is required")
+        || text.contains("sudo: incorrect password")
+    {
         return TaskErrorKind::PermissionDenied;
+    }
+    if text.contains("requires ruby version")
+        || text.contains("not compatible with your ruby")
+        || (text.contains("no versions of") && text.contains("compatible with your ruby"))
+    {
+        // RubyGems has selected a release that this Ruby runtime cannot load;
+        // retrying the same command cannot change that deterministic constraint.
+        return TaskErrorKind::InvalidInput;
     }
     if text.contains("invalid") || text.contains("unknown option") || text.contains("usage:") {
         return TaskErrorKind::InvalidInput;
@@ -594,6 +633,9 @@ pub fn command(program: &str, args: impl IntoIterator<Item = impl AsRef<str>>) -
         env: HashMap::new(),
         cwd: None,
         stdin: None,
+        timeout: std::time::Duration::from_secs(300),
+        task_id: None,
+        sudo: false,
         pseudo_terminal: false,
         output_chunk_sink: None,
     }
@@ -634,6 +676,18 @@ mod tests {
         assert_eq!(
             classify_command_error(&result("permission denied")),
             TaskErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            classify_command_error(&result(
+                "sudo: no password was provided\nsudo: a password is required"
+            )),
+            TaskErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            classify_command_error(&result(
+                "There are no versions of i18n compatible with your Ruby & RubyGems\ni18n requires Ruby version >= 3.1"
+            )),
+            TaskErrorKind::InvalidInput
         );
         assert!(!classify_command_error(&result("invalid option")).is_retryable());
         assert!(!classify_command_error(&result("request timeout setting")).is_retryable());

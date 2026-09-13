@@ -21,7 +21,11 @@ CREATE TABLE IF NOT EXISTS task_attempts (
   status TEXT NOT NULL, started_at INTEGER, finished_at INTEGER,
   FOREIGN KEY(task_id) REFERENCES package_tasks(task_id) ON DELETE CASCADE
 );
-CREATE TABLE IF NOT EXISTS log_entries (id INTEGER PRIMARY KEY AUTOINCREMENT, message TEXT NOT NULL, emitted_at INTEGER NOT NULL, stream TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS log_entries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, message TEXT NOT NULL, emitted_at INTEGER NOT NULL,
+  stream TEXT NOT NULL, task_id TEXT,
+  FOREIGN KEY(task_id) REFERENCES package_tasks(task_id) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS scheduler_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_log_entries_emitted_at ON log_entries(emitted_at);
 CREATE INDEX IF NOT EXISTS idx_batches_created_at ON operation_batches(created_at);

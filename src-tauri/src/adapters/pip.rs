@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use crate::core::{Ecosystem, Operation, PackageRecord, PackageTask, ResourceKind, TaskErrorKind};
+use crate::disk_usage::normalize_python_name;
 use crate::executor::{CommandResult, CommandSpec};
 
 use super::adapter::{
@@ -33,7 +34,7 @@ impl PipAdapter {
                         "import site; print('\\n'.join([*site.getsitepackages(), site.getusersitepackages()]))",
                     ],
                 ),
-                cancel,
+                cancel.clone(),
             )
             .await
             .map_err(|error| classify_process_error(&error))?;
@@ -115,13 +116,30 @@ impl EcosystemAdapter for PipAdapter {
                     "python3",
                     ["-m", "pip", "list", "--outdated", "--format=json"],
                 ),
-                cancel,
+                cancel.clone(),
             )
             .await
             .map_err(|error| classify_process_error(&error))?;
         if !outdated.status.success() {
             return Err(self.classify_error(&outdated));
         }
+        let manageable = context
+            .run(
+                command(
+                    "python3",
+                    [
+                        "-c",
+                        "import importlib.metadata as m,json; print(json.dumps([(d.metadata.get('Name'), d.version) for d in m.distributions() if d.metadata.get('Name') and d.read_text('RECORD') is not None]))",
+                    ],
+                ),
+                cancel,
+            )
+            .await
+            .map_err(|error| classify_process_error(&error))?;
+        if !manageable.status.success() {
+            return Err(self.classify_error(&manageable));
+        }
+        let manageable = manageable_distributions(&manageable.stdout)?;
         let updates: std::collections::HashMap<_, _> = json_array_versions(&outdated.stdout)
             .map_err(|_| TaskErrorKind::CommandFailed)?
             .into_iter()
@@ -130,6 +148,9 @@ impl EcosystemAdapter for PipAdapter {
         Ok(json_array_versions(&installed.stdout)
             .map_err(|_| TaskErrorKind::CommandFailed)?
             .into_iter()
+            .filter(|(name, version, _)| {
+                manageable.contains(&(normalize_python_name(name), version.clone()))
+            })
             .map(|(name, current, _)| {
                 package_record(
                     Ecosystem::Pip,
@@ -186,5 +207,34 @@ impl EcosystemAdapter for PipAdapter {
     }
     fn classify_error(&self, result: &CommandResult) -> TaskErrorKind {
         super::adapter::classify_command_error(result)
+    }
+}
+
+fn manageable_distributions(
+    output: &str,
+) -> Result<std::collections::HashSet<(String, String)>, TaskErrorKind> {
+    serde_json::from_str::<Vec<(String, String)>>(output)
+        .map_err(|_| TaskErrorKind::CommandFailed)
+        .map(|distributions| {
+            distributions
+                .into_iter()
+                .map(|(name, version)| (normalize_python_name(&name), version))
+                .collect()
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::manageable_distributions;
+
+    #[test]
+    fn manageable_distributions_require_the_exact_installed_version() {
+        let distributions =
+            manageable_distributions(r#"[["pydantic_core", "2.41.5"], ["demo.package", "1.0"]]"#)
+                .unwrap();
+
+        assert!(distributions.contains(&("pydantic-core".into(), "2.41.5".into())));
+        assert!(!distributions.contains(&("pydantic-core".into(), "2.46.5".into())));
+        assert!(distributions.contains(&("demo-package".into(), "1.0".into())));
     }
 }

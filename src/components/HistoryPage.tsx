@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
-import { ListRestart, RotateCcw } from "lucide-react";
-import { getStateSnapshot, listTaskAttempts, retryTask } from "../api/tauri";
+import { FileText, RotateCcw } from "lucide-react";
+import { getStateSnapshot, listTaskLogs, retryTask } from "../api/tauri";
 import { useI18n } from "../i18n/useI18n";
 import { applySnapshot, useAppStore } from "../state/appStore";
-import type { Ecosystem, OperationBatch, PackageTask, TaskAttempt, TaskStatus } from "../types";
+import type { Ecosystem, LogEntry, OperationBatch, PackageTask, TaskStatus } from "../types";
 import LogViewer from "./LogViewer";
 
 const ecosystems: Array<Ecosystem | "all"> = ["all", "homebrew", "npm", "pip", "gem", "rustup"];
@@ -34,6 +34,7 @@ export default function HistoryPage() {
   const { t } = useI18n();
   const batches = useAppStore((state) => state.batches);
   const logs = useAppStore((state) => state.logs);
+  const historyRevision = useAppStore((state) => state.historyRevision);
   const operationsDisabled = useAppStore((state) => state.operationsDisabled);
   const [ecosystem, setEcosystem] = useState<Ecosystem | "all">("all");
   const [status, setStatus] = useState<TaskStatus | "all">("all");
@@ -41,12 +42,16 @@ export default function HistoryPage() {
   const [period, setPeriod] = useState<(typeof periods)[number]>("all");
   const [retrying, setRetrying] = useState<string>();
   const [expanded, setExpanded] = useState<string>();
-  const [attempts, setAttempts] = useState<Record<string, TaskAttempt[]>>({});
+  const [taskLogs, setTaskLogs] = useState<Record<string, LogEntry[]>>({});
   const [error, setError] = useState<string>();
 
   useEffect(() => {
-    void getStateSnapshot().then(applySnapshot).catch(() => undefined);
-  }, []);
+    let current = true;
+    void getStateSnapshot().then((snapshot) => {
+      if (current) applySnapshot(snapshot);
+    }).catch(() => undefined);
+    return () => { current = false; };
+  }, [historyRevision]);
 
   const filtered = useMemo(() => {
     const now = Date.now() / 1000;
@@ -70,15 +75,15 @@ export default function HistoryPage() {
     }
   };
 
-  const toggleAttempts = async (taskId: string) => {
+  const toggleLogs = async (taskId: string) => {
     if (expanded === taskId) {
       setExpanded(undefined);
       return;
     }
     setExpanded(taskId);
-    if (!attempts[taskId]) {
-      const next = await listTaskAttempts(taskId).catch(() => []);
-      setAttempts((current) => ({ ...current, [taskId]: next }));
+    if (!taskLogs[taskId]) {
+      const next = await listTaskLogs(taskId).catch(() => []);
+      setTaskLogs((current) => ({ ...current, [taskId]: next }));
     }
   };
 
@@ -111,11 +116,11 @@ export default function HistoryPage() {
                           <div><strong>{task.name}</strong><span>{t(`operations.${task.operation}`)}{task.error ? ` · ${task.error}` : ""}</span></div>
                           <div className="history-task-meta">
                             <span className={`status-badge status-${task.status}`}>{t(`task.${task.status}`)}</span>
-                            <button type="button" className="button button-secondary button-small" onClick={() => void toggleAttempts(task.task_id)}><ListRestart size={14} aria-hidden="true" />{t("history.attempts")}</button>
+                            <button type="button" className="button button-secondary button-small" onClick={() => void toggleLogs(task.task_id)}><FileText size={14} aria-hidden="true" />{t("history.logs")}</button>
                             {(task.status === "failed" || task.status === "interrupted") && <button type="button" className="button button-secondary button-small" disabled={operationsDisabled || retrying === task.task_id} onClick={() => void retry(task.task_id)}><RotateCcw size={14} aria-hidden="true" />{t("history.retry")}</button>}
                           </div>
                         </div>
-                        {expanded === task.task_id && <div className="attempt-list">{(attempts[task.task_id] ?? []).length === 0 ? <span>{t("history.no_attempts")}</span> : (attempts[task.task_id] ?? []).map((attempt) => <div key={attempt.id}><strong>#{attempt.attempt}</strong><span>{attempt.status}</span><span>{formatTime(attempt.started_at)} - {formatTime(attempt.finished_at)}</span></div>)}</div>}
+                        {expanded === task.task_id && <div className="task-log-list"><LogViewer entries={taskLogs[task.task_id] ?? []} emptyLabel={t("history.no_logs")} /></div>}
                       </div>
                     ))}
                   </div>

@@ -18,6 +18,27 @@ describe("app store", () => {
     expect(getAppState().tasks).toEqual([]);
   });
 
+  it("updates the matching history batch when task status changes", () => {
+    applySnapshot({
+      workers: {}, packages: [], logs: [], active_tasks: 1,
+      tasks: [{ task_id: "history-task", ecosystem: "gem", name: "rake@13.0.6", operation: "update", status: "running" }],
+      batches: [{ batch_id: "batch", ecosystem: "gem", created_at: 1, tasks: [{ task_id: "history-task", ecosystem: "gem", name: "rake@13.0.6", operation: "update", status: "running" }] }],
+    });
+
+    applyEvent("task-progress", { task_id: "history-task", ecosystem: "gem", name: "rake@13.0.6", operation: "update", sequence: 1, emitted_at: 1, status: "failed", error: "command_failed", completed: 1, total: 1 });
+
+    expect(getAppState().batches[0].tasks[0]).toMatchObject({ status: "failed", error: "command_failed" });
+    expect(getAppState().historyRevision).toBeGreaterThan(0);
+  });
+
+  it("clears completed download progress when Homebrew enters processing", () => {
+    applySnapshot({ workers: {}, packages: [], logs: [], active_tasks: 1, tasks: [{ task_id: "brew", ecosystem: "homebrew", name: "cask:chatgpt", operation: "update", status: "running" }] });
+    applyEvent("task-progress", { task_id: "brew", ecosystem: "homebrew", sequence: 1, emitted_at: 0, status: "running", completed: 15_500_000, total: 15_500_000, eta_seconds: 0 });
+    applyEvent("task-progress", { task_id: "brew", ecosystem: "homebrew", sequence: 2, emitted_at: 1, status: "running", completed: 0, total: 0, eta_seconds: null, phase: "processing" });
+
+    expect(getAppState().tasks[0]).toMatchObject({ completed: 0, total: 0, eta_seconds: undefined, phase: "processing" });
+  });
+
   it("hides missing tools but keeps temporarily unavailable ecosystems visible", () => {
     setSettings(defaultSettings);
     applySnapshot({ workers: { npm: "missing", gem: "unavailable" }, packages: [], logs: [], active_tasks: 0, tasks: [] });
@@ -48,5 +69,21 @@ describe("app store", () => {
 
     expect(getAppState().packages).toHaveLength(500);
     expect(getAppState().tasks.map((task) => task.task_id)).toEqual(["scan"]);
+  });
+
+  it("removes an uninstalled package immediately", () => {
+    applySnapshot({ workers: {}, packages: [{ id: "npm:gone", ecosystem: "npm", resource_kind: "package", name: "gone", update_available: true }], logs: [], active_tasks: 0, tasks: [] });
+
+    applyEvent("package-removed", { ecosystem: "npm", sequence: 1, emitted_at: 0, package_id: "npm:gone" });
+
+    expect(getAppState().packages).toEqual([]);
+    expect(getAppState().totalUpdates).toBe(0);
+  });
+
+  it("keeps live command output scoped to its task", () => {
+    applySnapshot({ workers: {}, packages: [], logs: [], active_tasks: 0, tasks: [] });
+    applyEvent("log-entry", { ecosystem: "homebrew", sequence: 1, emitted_at: 1, task_id: "docker", entry: { emitted_at: 1, stream: "stdout", message: "download output" } });
+
+    expect(getAppState().logs).toContainEqual(expect.objectContaining({ task_id: "docker", message: "download output" }));
   });
 });

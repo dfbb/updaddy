@@ -396,6 +396,11 @@ fn successful_uninstall_removes_only_the_requested_package() {
         .unwrap();
     wait_for_success(&events, task_id);
 
+    assert!(events.0.lock().unwrap().iter().any(|event| matches!(
+        event,
+        WorkerEvent::PackageRemoved { package_id, .. } if package_id == &a.id
+    )));
+
     assert!(database.load_snapshot(&a.id).unwrap().is_none());
     assert!(cache.get(&a).unwrap().is_none());
     assert_eq!(database.load_snapshot(&b.id).unwrap(), Some(b.clone()));

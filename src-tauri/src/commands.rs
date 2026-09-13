@@ -144,12 +144,23 @@ impl AppState {
                 let settings = output_settings
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if settings.logs.retain_command_output
+                let retain = settings.logs.retain_command_output
                     && (settings.logs.level == "debug"
                         || settings.logs.level == "info"
-                        || output.stream == "stderr")
-                {
-                    output_bus.log(output.text, output.stream);
+                        || output.stream == "stderr");
+                let retain_task_error = output.task_id.is_some()
+                    && matches!(output.stream.as_str(), "stderr" | "error");
+                if output.task_id.is_some() || retain {
+                    let entry = crate::core::LogEntry {
+                        message: output.text,
+                        emitted_at: output.emitted_at,
+                        stream: output.stream,
+                    };
+                    if let Some(task_id) = output.task_id {
+                        output_bus.task_output(task_id, entry, retain || retain_task_error);
+                    } else {
+                        output_bus.log(entry.message, entry.stream);
+                    }
                 }
             }));
         if let Ok(config) = proxy_config_from_settings(&settings.lock().unwrap().proxy) {
@@ -423,19 +434,38 @@ pub fn update_all_visible(app: State<'_, AppState>) -> Result<Vec<TaskId>, Strin
     submit_all_visible(&app)
 }
 
+#[tauri::command]
+pub fn update_ecosystem(
+    app: State<'_, AppState>,
+    ecosystem: Ecosystem,
+) -> Result<Vec<TaskId>, String> {
+    ensure_visible(&app, ecosystem)?;
+    submit_visible_updates(
+        &app,
+        crate::scheduler::EnabledEcosystems::only(&[ecosystem]),
+    )
+}
+
 pub fn submit_all_visible(app: &AppState) -> Result<Vec<TaskId>, String> {
-    let snapshots = app
-        .database
-        .as_ref()
-        .map(|db| db.list_snapshots().map_err(|e| e.to_string()))
-        .transpose()?
-        .unwrap_or_default();
     let visible = crate::scheduler::EnabledEcosystems::only(
         &Ecosystem::ALL
             .into_iter()
             .filter(|e| app.visible(*e))
             .collect::<Vec<_>>(),
     );
+    submit_visible_updates(app, visible)
+}
+
+fn submit_visible_updates(
+    app: &AppState,
+    visible: crate::scheduler::EnabledEcosystems,
+) -> Result<Vec<TaskId>, String> {
+    let snapshots = app
+        .database
+        .as_ref()
+        .map(|db| db.list_snapshots().map_err(|e| e.to_string()))
+        .transpose()?
+        .unwrap_or_default();
     let commands = crate::scheduler::Scheduler::plan_visible_updates(visible, snapshots)
         .into_iter()
         .map(WorkerCommand::Update)
@@ -596,6 +626,22 @@ pub fn list_task_attempts(
         .map(|database| {
             database
                 .list_task_attempts(task_id)
+                .map_err(|error| error.to_string())
+        })
+        .transpose()
+        .map(|value| value.unwrap_or_default())
+}
+
+#[tauri::command]
+pub fn list_task_logs(
+    app: State<'_, AppState>,
+    task_id: TaskId,
+) -> Result<Vec<crate::core::LogEntry>, String> {
+    app.database
+        .as_ref()
+        .map(|database| {
+            database
+                .list_task_logs(task_id)
                 .map_err(|error| error.to_string())
         })
         .transpose()

@@ -480,7 +480,7 @@ fn metadata_distribution_name(path: &Path) -> Option<String> {
     })
 }
 
-fn normalize_python_name(name: &str) -> String {
+pub(crate) fn normalize_python_name(name: &str) -> String {
     let mut normalized = String::with_capacity(name.len());
     let mut separator = false;
     for character in name.chars() {

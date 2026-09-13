@@ -31,7 +31,7 @@ button:focus-visible { outline: 3px solid color-mix(in srgb, var(--color-accent)
 
 .app-shell { display: flex; height: 100%; min-height: 0; flex-direction: column; overflow: hidden; background: var(--color-background); }
 .app-header { display: flex; flex: 0 0 auto; align-items: center; justify-content: space-between; min-height: 76px; padding: 16px 30px; border-bottom: 1px solid var(--color-border); background: color-mix(in srgb, var(--color-surface), transparent 2%); }
-.brand-lockup, .header-actions, .header-summary, .summary-card-heading, .task-progress-heading, .package-actions, .dialog-actions, .section-heading, .history-task, .history-task-meta { display: flex; align-items: center; }
+.brand-lockup, .header-actions, .header-summary, .summary-card-heading, .task-progress-heading, .package-actions, .panel-actions, .dialog-actions, .section-heading, .history-task, .history-task-meta { display: flex; align-items: center; }
 .brand-lockup { gap: 11px; }
 .brand-mark { display: grid; width: 36px; height: 36px; place-items: center; border-radius: var(--radius-md); background: var(--color-accent); color: white; font-size: 23px; font-weight: 700; }
 .brand-lockup h1, .brand-lockup p, .page-heading h2, .page-heading p, .panel-heading h2, .panel-heading p, .empty-state h3, .empty-state p, .task-progress p { margin: 0; }
@@ -40,6 +40,7 @@ button:focus-visible { outline: 3px solid color-mix(in srgb, var(--color-accent)
 .brand-lockup p { margin-top: 2px; font-size: 12px; }
 .header-summary { gap: 9px; padding: 8px 12px; border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-surface); }
 .header-actions { gap: 10px; }
+.panel-actions { gap: 8px; }
 .header-settings { min-width: 36px; padding: 6px 9px; }
 .header-summary-label { font-size: 12px; }
 .update-count { color: var(--color-accent); font-size: 17px; }
@@ -122,7 +123,17 @@ button:focus-visible { outline: 3px solid color-mix(in srgb, var(--color-accent)
 .progress-indeterminate { position: relative; background: color-mix(in srgb, var(--color-accent), transparent 82%); }
 .progress-indeterminate::after { position: absolute; inset: 0 auto 0 -25%; width: 35%; border-radius: inherit; background: var(--color-accent); content: ""; animation: progress-slide 1.2s ease-in-out infinite; }
 .task-progress-message { margin-top: 7px !important; font-size: 11px; }
+.task-view-log { white-space: nowrap; }
+.task-log-overlay { position: fixed; inset: 0; z-index: 1000; display: flex; align-items: flex-start; justify-content: center; padding: 8vh 24px 24px; background: rgb(15 23 42 / 28%); }
+.task-log-dialog { width: min(960px, 100%); max-height: 84vh; overflow: hidden; border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-surface); box-shadow: 0 20px 60px rgb(15 23 42 / 24%); }
+.task-log-dialog-heading { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 13px 16px; border-bottom: 1px solid var(--color-border); }
+.task-log-dialog-body { max-height: calc(84vh - 64px); overflow: auto; padding: 0 16px 16px; }
+.task-log-dialog-body .log-viewer { max-height: none; }
+.task-log-dialog-body .log-console { height: calc(84vh - 96px); margin-top: 16px; padding: 14px 16px; overflow: auto; border: 0; border-radius: var(--radius-sm); background: #111315; color: #e8eaed; font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+.log-console .log-entry { display: block; padding: 0; border: 0; }
+.log-console .log-entry pre { color: inherit; font: inherit; white-space: pre-wrap; }
 .task-cancel { flex: 0 0 auto; }
+.task-cancel-error { flex-basis: 100%; margin: 0; color: var(--color-danger); font-size: 12px; }
 .disk-measuring { color: var(--color-muted); font-size: 12px; }
 
 .empty-state { display: grid; max-width: 530px; min-height: 220px; margin: 22px auto; padding: 34px 22px; place-items: center; align-content: center; border: 1px dashed var(--color-border); border-radius: var(--radius-md); color: var(--color-muted); text-align: center; }
@@ -189,8 +200,8 @@ button:focus-visible { outline: 3px solid color-mix(in srgb, var(--color-accent)
 .history-task strong { margin-bottom: 4px; }
 .history-task span { color: var(--color-muted); font-size: 12px; }
 .history-task-meta { gap: 9px; }
-.attempt-list { display: grid; gap: 6px; padding: 0 0 12px 14px; color: var(--color-muted); font-size: 12px; }
-.attempt-list > div { display: grid; grid-template-columns: 42px 80px 1fr; gap: 8px; }
+.task-log-list { padding: 0 0 14px; }
+.task-log-list .log-viewer { max-height: 280px; }
 
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes progress-slide { to { transform: translateX(360%); } }
@@ -205,6 +216,7 @@ button:focus-visible { outline: 3px solid color-mix(in srgb, var(--color-accent)
   .app-content { padding: 24px 16px 42px; }
   .page-heading, .panel-heading { flex-direction: column; align-items: stretch; }
   .page-heading .button, .panel-heading .button { align-self: flex-start; }
+  .panel-actions { flex-wrap: wrap; }
   .task-progress { align-items: stretch; flex-direction: column; }
   .task-cancel { align-self: flex-start; }
   .history-filters { align-items: stretch; flex-direction: column; gap: 8px; }
@@ -212,8 +224,6 @@ button:focus-visible { outline: 3px solid color-mix(in srgb, var(--color-accent)
   .history-filters { display: grid; grid-template-columns: 1fr; }
   .history-batch-heading, .history-task { align-items: flex-start; flex-direction: column; }
   .history-task-meta { flex-wrap: wrap; }
-  .attempt-list > div { grid-template-columns: 42px 1fr; }
-  .attempt-list > div span:last-child { grid-column: 1 / -1; }
   .log-entry { grid-template-columns: 1fr; gap: 3px; }
   .section-heading { align-items: flex-start; flex-direction: column; }
 }

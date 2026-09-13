@@ -49,10 +49,11 @@ impl EventBus {
                 } => {
                     database.update_task(*task_id, *status, *error).and_then(|ok| if ok { Ok(()) } else { Err(crate::persistence::PersistenceError::InvalidValue("task missing".into())) })
                 }
-                WorkerEvent::LogEntry { entry, .. } => {
-                    database.append_log(entry)
+                WorkerEvent::LogEntry { task_id, entry, .. } => {
+                    database.append_task_log(*task_id, entry)
                 }
                 WorkerEvent::PackageChanged { package, .. } => database.save_snapshot(package),
+                WorkerEvent::PackageRemoved { .. } => Ok(()),
                 // DiskUsage 在 worker 完成测量时已经用完整缓存键持久化；
                 // 事件总线不再用不完整键覆盖缓存。
                 WorkerEvent::DiskUsage { .. } => Ok(()),
@@ -75,6 +76,7 @@ impl EventBus {
             WorkerEvent::WorkerState { .. } => "worker-state",
             WorkerEvent::TaskProgress { .. } => "task-progress",
             WorkerEvent::PackageChanged { .. } => "package-changed",
+            WorkerEvent::PackageRemoved { .. } => "package-removed",
             WorkerEvent::DiskUsage { .. } => "disk-usage",
             WorkerEvent::LogEntry { .. } => "log-entry",
             WorkerEvent::BatchSummary { .. } => "batch-summary",
@@ -99,6 +101,22 @@ impl EventBus {
         }
         if let Some(app) = self.app.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
             let _ = app.emit("log-entry", &entry);
+        }
+    }
+
+    pub fn task_output(&self, task_id: uuid::Uuid, entry: LogEntry, persist: bool) {
+        if persist {
+            if let Some(database) = &self.database {
+                if let Err(error) = database.append_task_log(task_id, &entry) {
+                    eprintln!("updaddy: {error}");
+                }
+            }
+        }
+        if let Some(app) = self.app.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+            let _ = app.emit(
+                "log-entry",
+                serde_json::json!({ "task_id": task_id, "entry": entry }),
+            );
         }
     }
 }

@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
@@ -9,7 +9,7 @@ use crate::disk_usage::{resolve_package_paths, PackageInstallPaths};
 use crate::executor::{CommandResult, CommandSpec};
 
 use super::adapter::{
-    classify_process_error, command, detect_process_error, home_path, package_record,
+    askpass_path, classify_process_error, command, detect_process_error, home_path, package_record,
     validate_resource_name, EcosystemAdapter, ExecutorContext,
 };
 use super::parsers::lines;
@@ -193,10 +193,15 @@ impl EcosystemAdapter for HomebrewAdapter {
         validate_resource_name(Ecosystem::Homebrew, kind, name)?;
         let args: Vec<String> = match (task.operation, kind) {
             (crate::core::Operation::Update, ResourceKind::Formula) => {
-                vec!["upgrade".into(), name.into()]
+                vec!["upgrade".into(), "--yes".into(), name.into()]
             }
             (crate::core::Operation::Update, ResourceKind::Cask) => {
-                vec!["upgrade".into(), "--cask".into(), name.into()]
+                vec![
+                    "upgrade".into(),
+                    "--yes".into(),
+                    "--cask".into(),
+                    name.into(),
+                ]
             }
             (crate::core::Operation::Update, ResourceKind::Tap) => vec!["update".into()],
             (crate::core::Operation::Uninstall, ResourceKind::Formula) => {
@@ -211,8 +216,29 @@ impl EcosystemAdapter for HomebrewAdapter {
             _ => return Err(TaskErrorKind::InvalidInput),
         };
         let mut spec = command("brew", args);
+        if matches!(kind, ResourceKind::Formula | ResourceKind::Cask)
+            && matches!(
+                task.operation,
+                crate::core::Operation::Update | crate::core::Operation::Uninstall
+            )
+        {
+            let askpass = askpass_path().ok_or(TaskErrorKind::CommandFailed)?;
+            spec.env.insert(
+                "SUDO_ASKPASS".into(),
+                askpass.to_string_lossy().into_owned(),
+            );
+            // Homebrew invokes sudo itself for privileged cask/formula steps;
+            // this makes those nested sudo calls use the same dialog helper.
+            spec.env
+                .insert("SUDO_ASKPASS_REQUIRE".into(), "force".into());
+        }
         spec.pseudo_terminal = task.operation == crate::core::Operation::Update
             && matches!(kind, ResourceKind::Formula | ResourceKind::Cask);
+        if spec.pseudo_terminal {
+            // Brew may spend a long time verifying or installing a large cask
+            // without emitting bytes. Output still resets this idle timer.
+            spec.timeout = Duration::from_secs(2 * 60 * 60);
+        }
         Ok(spec)
     }
 
@@ -371,6 +397,14 @@ pub(crate) struct HomebrewDownloadProgress {
     pub downloaded_bytes: u64,
     pub total_bytes: u64,
     pub eta_seconds: Option<u64>,
+    pub phase: HomebrewProgressPhase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HomebrewProgressPhase {
+    Downloading,
+    DownloadingUnknownTotal,
+    Processing,
 }
 
 #[derive(Default)]
@@ -409,6 +443,13 @@ impl HomebrewProgressTracker {
         self.last_sample = Some((downloaded_bytes, now));
         self.last_emitted = Some((downloaded_bytes, total_bytes));
 
+        let phase = if total_bytes == 0 {
+            HomebrewProgressPhase::DownloadingUnknownTotal
+        } else if downloaded_bytes >= total_bytes {
+            HomebrewProgressPhase::Processing
+        } else {
+            HomebrewProgressPhase::Downloading
+        };
         let eta_seconds = self.bytes_per_second.and_then(|speed| {
             (speed > 1.0 && downloaded_bytes < total_bytes)
                 .then(|| ((total_bytes - downloaded_bytes) as f64 / speed).ceil() as u64)
@@ -417,6 +458,7 @@ impl HomebrewProgressTracker {
             downloaded_bytes,
             total_bytes,
             eta_seconds,
+            phase,
         })
     }
 }
@@ -461,8 +503,10 @@ fn parse_latest_size_pair(output: &str) -> Option<(u64, u64)> {
                 .filter(|(_, consumed)| *consumed == candidate.len())
                 .map(|(bytes, _)| bytes)
         })?;
-        let (total, _) = parse_size_prefix(right)?;
-        (total > 0 && downloaded <= total).then_some((downloaded, total))
+        let total = parse_size_prefix(right)
+            .map(|(bytes, _)| bytes)
+            .or_else(|| right.trim_start().starts_with('-').then_some(0))?;
+        (total == 0 || downloaded <= total).then_some((downloaded, total))
     })
 }
 
@@ -571,8 +615,10 @@ mod tests {
 
     use super::{
         changed_taps, installed_cask_versions, outdated_versions, resolve_cask_artifacts,
-        HomebrewProgressTracker,
+        HomebrewAdapter, HomebrewProgressPhase, HomebrewProgressTracker,
     };
+    use crate::adapters::EcosystemAdapter;
+    use crate::core::{Ecosystem, Operation, PackageTask};
     use crate::disk_usage::{measure_paths, PackageInstallPaths};
 
     #[test]
@@ -615,6 +661,7 @@ mod tests {
         assert_eq!(first.downloaded_bytes, 10_000_000);
         assert_eq!(first.total_bytes, 100_000_000);
         assert_eq!(first.eta_seconds, None);
+        assert_eq!(first.phase, HomebrewProgressPhase::Downloading);
 
         let second = tracker
             .push(
@@ -625,6 +672,46 @@ mod tests {
         assert_eq!(second.downloaded_bytes, 30_000_000);
         assert_eq!(second.total_bytes, 100_000_000);
         assert_eq!(second.eta_seconds, Some(7));
+        assert_eq!(second.phase, HomebrewProgressPhase::Downloading);
+    }
+
+    #[test]
+    fn completed_download_switches_to_processing_instead_of_stale_full_progress() {
+        let progress = HomebrewProgressTracker::default()
+            .push(b"metadata  Downloading  15.5MB/15.5MB", Instant::now())
+            .unwrap();
+
+        assert_eq!(progress.phase, HomebrewProgressPhase::Processing);
+        assert_eq!(progress.eta_seconds, None);
+    }
+
+    #[test]
+    fn reports_downloaded_bytes_when_homebrew_does_not_know_the_total_size() {
+        let progress = HomebrewProgressTracker::default()
+            .push(b"chatgpt  Downloading 476.2MB/-------", Instant::now())
+            .unwrap();
+
+        assert_eq!(progress.downloaded_bytes, 476_200_000);
+        assert_eq!(progress.total_bytes, 0);
+        assert_eq!(
+            progress.phase,
+            HomebrewProgressPhase::DownloadingUnknownTotal
+        );
+        assert_eq!(progress.eta_seconds, None);
+    }
+
+    #[test]
+    fn cask_updates_allow_large_downloads_to_run_beyond_five_minutes() {
+        let task = PackageTask::new(Ecosystem::Homebrew, "cask:chatgpt", Operation::Update);
+        let spec = HomebrewAdapter.plan(&task).unwrap();
+
+        assert_eq!(spec.timeout, Duration::from_secs(2 * 60 * 60));
+        assert!(spec.pseudo_terminal);
+        assert!(spec.env.contains_key("SUDO_ASKPASS"));
+        assert_eq!(
+            spec.env.get("SUDO_ASKPASS_REQUIRE").map(String::as_str),
+            Some("force")
+        );
     }
 
     #[test]

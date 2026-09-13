@@ -11,8 +11,8 @@ export const defaultSettings: Settings = {
   proxy: { enabled: false, address: "", username: "", password: "" },
   logs: { level: "info", retain_command_output: false },
 };
-export interface AppState { locale: string; theme: ThemeMode; visibleEcosystems: Ecosystem[]; settings: Settings; packages: PackageRecord[]; tasks: PackageTask[]; batches: OperationBatch[]; logs: LogEntry[]; workers: Record<string, string>; activeTaskIds: string[]; operationsDisabled: boolean; totalUpdates: number; lastBatchSummary?: BackendEvent; }
-let state: AppState = { locale: resolveLocale(), theme: "system", visibleEcosystems: defaultSettings.visible_ecosystems, settings: defaultSettings, packages: [], tasks: [], batches: [], logs: [], workers: {}, activeTaskIds: [], operationsDisabled: false, totalUpdates: 0 };
+export interface AppState { locale: string; theme: ThemeMode; visibleEcosystems: Ecosystem[]; settings: Settings; packages: PackageRecord[]; tasks: PackageTask[]; batches: OperationBatch[]; logs: LogEntry[]; workers: Record<string, string>; activeTaskIds: string[]; operationsDisabled: boolean; totalUpdates: number; historyRevision: number; lastBatchSummary?: BackendEvent; }
+let state: AppState = { locale: resolveLocale(), theme: "system", visibleEcosystems: defaultSettings.visible_ecosystems, settings: defaultSettings, packages: [], tasks: [], batches: [], logs: [], workers: {}, activeTaskIds: [], operationsDisabled: false, totalUpdates: 0, historyRevision: 0 };
 const listeners = new Set<Listener>();
 const emit = () => listeners.forEach((l) => l());
 const setState = (next: Partial<AppState>) => { state = { ...state, ...next }; emit(); };
@@ -37,8 +37,11 @@ export function applySnapshot(snapshot: StateSnapshot) {
 }
 function reduceEvent(current: AppState, name: string, payload: BackendEvent): AppState {
   let tasks = current.tasks;
+  let batches = current.batches;
+  let historyRevision = current.historyRevision;
   if (name === "task-progress" && payload.task_id) {
     const existing = tasks.find((task) => task.task_id === payload.task_id);
+    const historyTask = batches.flatMap((batch) => batch.tasks).find((task) => task.task_id === payload.task_id);
     const next: PackageTask = {
       task_id: String(payload.task_id),
       ecosystem: payload.ecosystem as Ecosystem,
@@ -48,21 +51,46 @@ function reduceEvent(current: AppState, name: string, payload: BackendEvent): Ap
       error: payload.error,
       completed: typeof payload.completed === "number" ? payload.completed : existing?.completed,
       total: typeof payload.total === "number" ? payload.total : existing?.total,
-      eta_seconds: typeof payload.eta_seconds === "number" ? payload.eta_seconds : existing?.eta_seconds,
+      eta_seconds: "eta_seconds" in payload ? (typeof payload.eta_seconds === "number" ? payload.eta_seconds : undefined) : existing?.eta_seconds,
+      phase: "phase" in payload ? (typeof payload.phase === "string" ? payload.phase : undefined) : existing?.phase,
       message: payload.message ?? existing?.message,
     };
+    if (existing?.status !== next.status && historyTask?.status !== next.status) {
+      historyRevision += 1;
+    }
+    batches = batches.map((batch) => ({
+      ...batch,
+      tasks: batch.tasks.map((task) => task.task_id === payload.task_id ? {
+        ...task,
+        status: next.status,
+        error: next.error,
+        completed: next.completed,
+        total: next.total,
+        eta_seconds: next.eta_seconds,
+        phase: next.phase,
+        message: next.message,
+      } : task),
+    }));
     if (isVisibleTask(next)) {
       tasks = existing ? tasks.map((task) => task.task_id === payload.task_id ? { ...task, ...next } : task) : [...tasks, next];
     } else if (existing) {
       tasks = tasks.filter((task) => task.task_id !== payload.task_id);
     }
   }
-  const packages = name === "package-changed" && payload.package ? [...current.packages.filter((p) => p.id !== payload.package.id), payload.package] : name === "disk-usage" && payload.package_id ? current.packages.map((p) => p.id === payload.package_id ? { ...p, disk_usage: payload.disk_usage } : p) : current.packages;
-  const logEntry = name === "log-entry" ? (payload.entry ?? (payload.message ? { message: payload.message, emitted_at: payload.emitted_at, stream: payload.stream ?? "system" } : undefined)) : undefined;
+  const packages = name === "package-changed" && payload.package
+    ? [...current.packages.filter((p) => p.id !== payload.package.id), payload.package]
+    : name === "package-removed" && payload.package_id
+      ? current.packages.filter((p) => p.id !== payload.package_id)
+      : name === "disk-usage" && payload.package_id
+        ? current.packages.map((p) => p.id === payload.package_id ? { ...p, disk_usage: payload.disk_usage } : p)
+        : current.packages;
+  const logEntry = name === "log-entry" ? (payload.entry
+    ? { ...payload.entry, task_id: payload.task_id ? String(payload.task_id) : payload.entry.task_id }
+    : (payload.message ? { message: payload.message, emitted_at: payload.emitted_at, stream: payload.stream ?? "system", task_id: payload.task_id ? String(payload.task_id) : undefined } : undefined)) : undefined;
   const logs = logEntry ? [...current.logs, logEntry] : current.logs;
   const workers = name === "worker-state" ? { ...current.workers, [payload.ecosystem]: payload.state } : current.workers;
   const visibleEcosystems = name === "worker-state" ? effectiveVisible(current.settings.visible_ecosystems, workers) : current.visibleEcosystems;
-  return { ...current, tasks, packages, logs, workers, visibleEcosystems, lastBatchSummary: name === "batch-summary" ? payload : current.lastBatchSummary };
+  return { ...current, tasks, batches, packages, logs, workers, visibleEcosystems, historyRevision, lastBatchSummary: name === "batch-summary" ? payload : current.lastBatchSummary };
 }
 export function applyEvents(events: ReadonlyArray<readonly [string, BackendEvent]>) {
   if (events.length === 0) return;

@@ -19,7 +19,7 @@ pub fn run() -> tauri::Result<()> {
             .map_err(|e| tauri::Error::Setup((Box::new(e) as Box<dyn std::error::Error>).into()))?,
     ));
     if let Some(database) = &database {
-        let _ = database.mark_running_tasks_interrupted();
+        let _ = database.mark_active_tasks_interrupted();
         let cutoff = chrono::Utc::now().timestamp() - 90 * 24 * 60 * 60;
         let _ = database.cleanup_before(cutoff);
     }
@@ -68,6 +68,11 @@ pub fn run() -> tauri::Result<()> {
             }
             let scheduled_state = scheduler_state.clone();
             scheduler.set_runner(move || {
+                if crate::commands::schedule_from_settings(&scheduled_state.settings_snapshot())
+                    .is_none()
+                {
+                    return false;
+                }
                 match crate::commands::submit_all_visible(&scheduled_state) {
                     Ok(_) => true,
                     Err(error) => {
@@ -100,6 +105,7 @@ pub fn run() -> tauri::Result<()> {
             commands::update_package,
             commands::uninstall_package,
             commands::update_all_visible,
+            commands::update_ecosystem,
             commands::cancel_task,
             commands::get_state_snapshot,
             commands::get_settings,
@@ -109,6 +115,7 @@ pub fn run() -> tauri::Result<()> {
             commands::refresh_disk_usage,
             commands::cleanup_expired_logs,
             commands::list_task_attempts,
+            commands::list_task_logs,
             commands::retry_task,
         ])
         .build(tauri::generate_context!())?

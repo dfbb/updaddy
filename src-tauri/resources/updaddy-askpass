@@ -1,0 +1,20 @@
+#!/bin/sh
+
+# sudo calls this helper and consumes stdout as the password. Keep the
+# AppleScript in one invocation so the dialog result cannot be lost between
+# separate osascript programs, and never emit diagnostic text on stdout.
+set -eu
+password=$(/usr/bin/osascript <<'APPLESCRIPT'
+try
+  set dialogResult to display dialog "Updaddy needs administrator privileges to complete this operation." default answer "" with hidden answer buttons {"Cancel", "OK"} default button "OK" with title "Updaddy"
+  return text returned of dialogResult
+on error number -128
+  error number -128
+end try
+APPLESCRIPT
+)
+
+if [ -z "$password" ]; then
+  exit 1
+fi
+printf '%s\n' "$password"

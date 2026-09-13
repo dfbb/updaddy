@@ -17,7 +17,7 @@ pub use adapter::{
 };
 pub use gem::GemAdapter;
 pub use homebrew::HomebrewAdapter;
-pub(crate) use homebrew::HomebrewProgressTracker;
+pub(crate) use homebrew::{HomebrewProgressPhase, HomebrewProgressTracker};
 pub use npm::NpmAdapter;
 pub use pip::PipAdapter;
 pub use rustup::RustupAdapter;
